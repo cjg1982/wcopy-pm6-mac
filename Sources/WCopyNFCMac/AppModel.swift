@@ -6,7 +6,7 @@ enum NavigationPage: String, CaseIterable, Identifiable {
     case overview = "概览"
     case read = "读取与备份"
     case restore = "恢复转储"
-    case mfocRecovery = "mfoc 密钥恢复"
+    case mfocRecovery = "密钥恢复"
     case uid = "UID 工具"
     case format = "格式化"
     case libnfc = "libnfc 桥接"
@@ -138,7 +138,9 @@ final class AppModel: ObservableObject {
 
     func cancelOperation() { cancellationToken?.cancel() }
 
-    func readCard(
+    /// 「开始读取」：先用界面中填写的密钥直接读取；若认证失败或未填写密钥，
+    /// 自动以该密钥 + 快速字典进行密钥检测并读取。
+    func readAndDetect(
         key: String,
         keyType: KeyType,
         readAll: Bool,
@@ -148,24 +150,87 @@ final class AppModel: ObservableObject {
         guard let reader else { errorMessage = AppError.notConnected.localizedDescription; return }
         readResult = nil
         activeDump = nil
-        startOperation(label: "读取卡片") { [weak self] token in
-            let requested = readAll ? nil : try parseSectors(sectors)
-            let result = try reader.readCard(
-                keyHex: key,
-                keyType: keyType,
-                sectors: requested,
+        startOperation(label: "自动检测并读取") { [weak self] token in
+            guard let self else { return }
+            let normalized = try? normalizeMifareKey(key)
+
+            // Fast path: read directly with the user-supplied key.
+            if let normalized {
+                let requested = try (readAll ? nil : parseSectors(sectors))
+                let fast = try reader.readCard(
+                    keyHex: normalized,
+                    keyType: keyType,
+                    sectors: requested,
+                    scanMode: scanMode,
+                    progress: { value, text in self.updateProgress(value, text: text) },
+                    token: token
+                )
+                if fast.failedSectors.isEmpty && !fast.blocks.isEmpty {
+                    let dump = fast.dump(key: normalized, keyType: keyType)
+                    let sectorCount = fast.target.kind.sectorCount
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        let authenticated = Set(0 ..< sectorCount).subtracting(fast.failedSectors)
+                        for sector in authenticated {
+                            var result = self.keyResults[sector] ?? SectorKeyResult(sector: sector)
+                            if keyType == .a {
+                                result.keyA = normalized
+                            } else {
+                                result.keyB = normalized
+                                result.keyBAuthenticates = true
+                            }
+                            self.keyResults[sector] = result
+                        }
+                        self.readResult = fast
+                        self.activeDump = dump
+                        self.noticeMessage = "已用密钥 \(normalized) 读取 \(fast.blocks.count) 个块"
+                    }
+                    return
+                }
+                self.appendLog("密钥 \(normalized) 未能认证全部扇区，开始自动密钥检测")
+            }
+
+            // Detection path: only the user-supplied key (SAK 19 cards get the
+            // UID-derived candidate added automatically inside checkKeys).
+            var candidates: [String] = []
+            if let normalized {
+                candidates = [normalized]
+            }
+            let outcome = try reader.checkKeys(
+                candidates: candidates,
                 scanMode: scanMode,
-                progress: { value, text in self?.updateProgress(value, text: text) },
+                progress: { value, text in self.updateProgress(value, text: text) },
                 token: token
             )
-            let dump = result.dump(key: key.uppercased(), keyType: keyType)
+            let result = ReadResult(
+                target: outcome.target,
+                blocks: outcome.blocks,
+                failedSectors: outcome.sectorKeys.values.filter { !$0.foundAny }.map(\.sector),
+                failedBlocks: outcome.failedBlocks
+            )
+            let defaultAuthentication = outcome.sectorKeys.values.sorted { $0.sector < $1.sector }.compactMap { slot -> (String, KeyType)? in
+                if let keyA = slot.keyA { return (keyA, .a) }
+                if let keyB = slot.keyB, slot.keyBAuthenticates != false { return (keyB, .b) }
+                return nil
+            }.first
+            let dump = defaultAuthentication.map {
+                result.dump(key: $0.0, keyType: $0.1, sectorKeys: outcome.sectorKeys)
+            }
             Task { @MainActor [weak self] in
-                self?.readResult = result
-                self?.activeDump = dump
-                let failures = result.failedSectors.count + result.failedBlocks.count
-                self?.noticeMessage = failures == 0
-                    ? "已读取 \(result.blocks.count) 个块"
-                    : "读取完成，但有 \(result.failedSectors.count) 个认证失败扇区、\(result.failedBlocks.count) 个读取失败块"
+                guard let self else { return }
+                self.keyResults = outcome.sectorKeys
+                self.keyCheckAttempts = outcome.attempts
+                self.keyCandidateCount = outcome.candidateCount
+                self.readResult = result
+                self.activeDump = dump
+                let foundSlots = outcome.sectorKeys.values.reduce(0) { $0 + ($1.keyA == nil ? 0 : 1) + ($1.keyB == nil ? 0 : 1) }
+                let totalSlots = outcome.sectorKeys.count * 2
+                if foundSlots < totalSlots {
+                    self.noticeMessage = nil
+                    self.showMfocPrompt = true
+                } else {
+                    self.noticeMessage = "自动检测完成：\(outcome.attempts) 次认证，找到 \(foundSlots)/\(totalSlots) 个密钥槽"
+                }
             }
         }
     }
@@ -299,7 +364,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func detectTargetKeys(scanMode: CardScanMode, preset: KeyDictionaryPreset = .quick, completion: @escaping ([Int: SectorKeyResult]) -> Void) {
+    func detectTargetKeys(scanMode: CardScanMode, preset: KeyDictionaryPreset = .common, completion: @escaping ([Int: SectorKeyResult]) -> Void) {
         guard let reader else { errorMessage = AppError.notConnected.localizedDescription; completion([:]); return }
         startOperation(label: "检测目标卡密钥") { [weak self] token in
             let outcome = try reader.checkKeys(
@@ -432,6 +497,164 @@ final class AppModel: ObservableObject {
                 completion?(status)
             }
         }
+    }
+
+    func runNativeRecovery(probes: Int = 20, progress: ((Double, String) -> Void)? = nil) {
+        guard connectionState == .connected, let reader else {
+            errorMessage = AppError.notConnected.localizedDescription
+            return
+        }
+        guard readResult != nil, !keyResults.isEmpty else {
+            errorMessage = "请先运行密钥检查以获取已知密钥"
+            return
+        }
+        let knownEntries = keyResults.values.sorted(by: { $0.sector < $1.sector })
+        let exploitEntries: [(sector: Int, keyHex: String, type: KeyType)] = knownEntries.flatMap { result -> [(Int, String, KeyType)] in
+            var entries: [(Int, String, KeyType)] = []
+            if let keyA = result.keyA { entries.append((result.sector, keyA, .a)) }
+            if let keyB = result.keyB, result.keyBAuthenticates != false { entries.append((result.sector, keyB, .b)) }
+            return entries
+        }
+        guard !exploitEntries.isEmpty else {
+            errorMessage = "没有可用的已知密钥作为攻击入口"
+            return
+        }
+        let missingSlots = keyResults.values.flatMap { result -> [(Int, KeyType)] in
+            var slots: [(Int, KeyType)] = []
+            if result.keyA == nil { slots.append((result.sector, .a)) }
+            if result.keyB == nil, result.keyBAuthenticates != false { slots.append((result.sector, .b)) }
+            return slots
+        }
+        guard !missingSlots.isEmpty else {
+            noticeMessage = "所有密钥槽已找到，无需恢复"
+            return
+        }
+
+        let currentTarget = readResult!.target
+        startOperation(label: "原生 Nested 密钥恢复", cancellable: true) { [weak self] token in
+            guard let self else { return }
+
+            let session = NestedRecoverySession(transport: reader, target: currentTarget, logger: self.appendLog)
+            var recoveredCount = 0
+
+            for (idx, slot) in missingSlots.enumerated() {
+                try token.check()
+                let slotProgress = Double(idx) / Double(missingSlots.count)
+                self.updateProgress(slotProgress, text: "恢复扇区 \(slot.0) Key \(slot.1.rawValue)")
+
+                var candidates: [String] = []
+                var foundExploit = false
+                for exploit in exploitEntries {
+                    try token.check()
+                    guard let exploitKeyData = try? HexCodec.data(from: exploit.keyHex, expectedBytes: 6) else { continue }
+                    self.appendLog("尝试用扇区 \(exploit.sector) Key \(exploit.type.rawValue) = \(exploit.keyHex) 作为入口")
+                    do {
+                        candidates = try session.recoverKey(
+                            exploitSector: exploit.sector,
+                            exploitKey: exploitKeyData,
+                            exploitType: exploit.type,
+                            targetSector: slot.0,
+                            targetType: slot.1,
+                            probes: probes
+                        ) { p, text in
+                            let overall = slotProgress + p / Double(missingSlots.count)
+                            self.updateProgress(overall, text: text)
+                        }
+                        if !candidates.isEmpty {
+                            foundExploit = true
+                            self.appendLog("使用扇区 \(exploit.sector) Key \(exploit.type.rawValue) 成功生成候选")
+                            break
+                        }
+                    } catch {
+                        self.appendLog("扇区 \(exploit.sector) Key \(exploit.type.rawValue) 失败：\(error.localizedDescription)")
+                    }
+                }
+                guard foundExploit, !candidates.isEmpty else {
+                    self.appendLog("扇区 \(slot.0) Key \(slot.1.rawValue)：所有入口均未能生成候选")
+                    progress?(Double(idx + 1) / Double(missingSlots.count),
+                              "扇区 \(slot.0) Key \(slot.1.rawValue)：未生成候选")
+                    continue
+                }
+
+                var found = false
+                for candidate in candidates.prefix(50) {
+                    try token.check()
+                    guard let keyBytes = try? HexCodec.data(from: candidate, expectedBytes: 6) else { continue }
+                    let topBlock = CardLayout.firstBlock(of: slot.0)
+                    if try reader.authenticate(
+                        block: topBlock,
+                        uid: currentTarget.uid,
+                        key: keyBytes,
+                        type: slot.1
+                    ) {
+                        self.appendLog("扇区 \(slot.0) Key \(slot.1.rawValue) = \(candidate)（已验证）")
+                        let revealed = Self.revealKeyBIfMissing(
+                            sector: slot.0,
+                            keyHex: candidate,
+                            target: currentTarget,
+                            reader: reader
+                        )
+                        Task { @MainActor [weak self] in
+                            guard let self else { return }
+                            var result = self.keyResults[slot.0] ?? SectorKeyResult(sector: slot.0)
+                            if slot.1 == .a {
+                                result.keyA = candidate
+                                if let revealed {
+                                    result.keyB = revealed.keyB
+                                    result.keyBAuthenticates = revealed.keyBAuthenticates
+                                }
+                            } else {
+                                result.keyB = candidate
+                                result.keyBAuthenticates = true
+                            }
+                            self.keyResults[slot.0] = result
+                        }
+                        if let revealed {
+                            self.appendLog("扇区 \(slot.0) 尾块揭示 Key B 字段 = \(revealed.keyB)（\(revealed.keyBAuthenticates == true ? "可认证" : "DATA")）")
+                        }
+                        recoveredCount += 1
+                        found = true
+                        break
+                    }
+                }
+                if !found {
+                    self.appendLog("扇区 \(slot.0) Key \(slot.1.rawValue)：候选密钥均未通过实卡认证")
+                }
+            }
+
+            let totalMissing = missingSlots.count
+            self.updateProgress(1, text: "恢复完成")
+            Task { @MainActor [weak self] in
+                self?.noticeMessage = "原生 Nested 恢复完成：\(recoveredCount)/\(totalMissing) 个缺失密钥槽"
+                progress?(1, "恢复完成：\(recoveredCount)/\(totalMissing)")
+            }
+        }
+    }
+
+    private struct RevealedKeyB {
+        let keyB: String
+        let keyBAuthenticates: Bool?
+    }
+
+    /// When a sector's Key A becomes known and Key B is still missing, read the
+    /// trailer with Key A to reveal the Key B field and test whether it can
+    /// authenticate. Runs off the main actor.
+    nonisolated private static func revealKeyBIfMissing(
+        sector: Int,
+        keyHex: String,
+        target: CardTarget,
+        reader: WCopyReader
+    ) -> RevealedKeyB? {
+        let trailer = CardLayout.trailerBlock(of: sector)
+        guard let keyData = try? HexCodec.data(from: keyHex, expectedBytes: 6),
+              (try? reader.authenticate(block: trailer, uid: target.uid, key: keyData, type: .a)) == true,
+              let trailerData = try? reader.readBlock(trailer) else {
+            return nil
+        }
+        let revealedKeyB = HexCodec.string(trailerData.suffix(6))
+        let keyBData = try? HexCodec.data(from: revealedKeyB, expectedBytes: 6)
+        let authenticates = keyBData.map { (try? reader.authenticate(block: trailer, uid: target.uid, key: $0, type: .b)) ?? false } ?? false
+        return RevealedKeyB(keyB: revealedKeyB, keyBAuthenticates: authenticates)
     }
 
     nonisolated private static func runCLIBridge(

@@ -9,10 +9,16 @@
 
 ## 设备支持
 
+![wCopy NFC 读卡器](docs/images/reader.png)
+
 | VID:PID | 状态 |
 | --- | --- |
 | `0416:b008` | 已在 `wCopy NSR106-IDIC V601` 实机完成 HID 序列同步和初始化握手 |
 | `0416:b030` | 上游在 Linux 真机验证过；本项目使用同一协议的原生 macOS 实现 |
+
+同样使用 wCopy USB-HID 协议（`0416:b008` / `0416:b030`）的同系列读卡器同样受支持：
+应用按 64 字节 HID 接口识别设备，因此其他 wCopy / NSR106-IDIC 风格的同类型 NFC 读卡器
+无需修改即可使用。
 
 应用将 USB 枚举和协议兼容性分开显示。看到设备不代表协议已经通过，只有完成序列号同步与
 四步初始化后才会显示“协议就绪”。如果 `b008` 同步失败，应用会保留诊断信息，而不会误报连接。
@@ -31,6 +37,7 @@
 - Magic / CUID 卡 4 字节 UID 修改，自动计算 BCC 并完整回读验证。
 - 格式化指定扇区，保留制造块 0。
 - 原生 raw PTY 桥接，可选运行 `nfc-list`、`mfoc`、`mfcuk`。
+- **原生 Nested 密钥恢复**：进程内重新实现 mfoc 的 Crypto1 与 Nested 认证攻击，无需安装 mfoc 即可恢复未知密钥。
 - HID 描述符、握手、日志和原始 PN532 命令诊断。
 - Agent 友好的 `wcopy-nfc` CLI，提供稳定 JSON 输出、退出码、只读/写入安全边界和无交互参数。
 
@@ -78,7 +85,7 @@ Release CLI 示例：
 ./dist/wcopy-nfc devices --pretty
 ./dist/wcopy-nfc reader-info --pretty
 ./dist/wcopy-nfc card-info --card-mode auto --pretty
-./dist/wcopy-nfc keys --preset quick --card-mode 1k --pretty
+./dist/wcopy-nfc keys --preset common --card-mode 1k --pretty
 ```
 
 CLI 的完整命令、JSON schema、退出码、安全规则和 Agent 工作流见 [`docs/CLI.md`](docs/CLI.md)。
@@ -92,14 +99,13 @@ macOS 的 IOKit HID 通常不需要类似 Linux udev 的权限规则。若打开
 2. 选中 `0416:B008`，点击“连接”。首次同步最多需要约 30 秒。
 3. 显示“协议就绪”后，将 13.56 MHz MIFARE Classic 卡片放在感应区。
 4. 先进入“读取与备份”保存 JSON。注意 MIFARE 硬件会隐藏尾块中的 Key A；需要先通过密钥检查获得完整 A/B 密钥，才可安全导出完整 MFD 或恢复尾块。
-5. 如果认证失败，使用“密钥检查”；未知密钥可选用 `mfoc` 桥接。
+5. 如果认证失败，使用“密钥检查”；未知密钥可在“密钥恢复”页使用原生 Nested 恢复（无需 mfoc），或选用外部 `mfoc` 桥接。
 
 ## 默认密钥词典
 
 “默认密钥检查”不是对完整 48 位密钥空间的穷举。应用只尝试用户选择的候选集合：
 
-- 快速默认键：13 个高命中默认键，与 `mfoc` 的默认集合一致。
-- 常用公开键：独立整理的常见默认值、测试值和公开部署键。
+- 常用公开键：独立整理的常见默认值、测试值和公开部署键（含 mfoc 高命中默认集）。
 - 弱模式扩展：在常用键基础上生成重复字节、连续递增与连续递减等弱模式。
 - 自定义词典：支持 Proxmark3 `.dic`、MIFARE Classic Tool `.keys` 和普通文本。
 
@@ -149,12 +155,21 @@ Key[5] = UID[2] XOR UID[3]
 认证结果优先于标准访问位静态解释的兼容行为。其他组合不会仅凭 SAK 断言具体厂商或芯片型号。
 
 公开默认键只能发现静态默认值或弱口令。对于真正随机、UID 派生或未知密钥，需要使用经授权的
-`mfoc`/`mfcuk` nested 或 DarkSide 流程，且是否可行取决于卡片 PRNG 与读卡器固件能力。
+nested / DarkSide 流程。本项目现已内置 **原生 mfoc 算法**：进程内实现 Crypto1 流密码、
+LFSR 状态恢复、PRNG 距离测量和密钥流恢复，直接驱动读卡器原始位帧完成 Nested 攻击，无需安装
+mfoc 或经过 PTY 桥接。是否可行仍取决于卡片 PRNG 与读卡器固件能力；外部 `mfoc` 仍可通过可选
+libnfc 桥接作为对照手段。
+
+词典检查留下未解决密钥槽后，“密钥恢复”页会依次把每个已知密钥作为攻击入口，测量 nonce 距离取
+中位数，恢复候选 LFSR 状态，并在实卡上逐一验证后才记录。扇区 Key A 恢复成功后会自动读取尾块，
+揭示可读的 Key B 字段并测试其是否可认证。同一引擎也以 `wcopy-nfc recover` 暴露给 CLI。
 
 设备协议对错误序列较敏感。如果 HID 已发现但同步失败，请拔下读卡器数秒后重新连接。不要在
 写入或格式化期间移动卡片或拔出设备。
 
 ## 可选 libnfc 工具
+
+原生 Nested 恢复和 `recover` CLI 命令不需要 libnfc 或 mfoc。外部工具仍可用于高级桥接场景：
 
 ```bash
 brew install libnfc mfoc mfcuk
@@ -165,7 +180,8 @@ GUI 启动桥接命令时会先释放自身的 HID 连接，再调用与 `dist/w
 `LIBNFC_DEFAULT_DEVICE=pn532_uart:<pty>`；命令结束后需在 GUI 中重新连接。
 GUI 会批量刷新桥接输出并隐藏高频逐帧预览，避免长时间 mfoc 恢复拖死界面；密钥结果、进度、
 警告和错误仍会显示。上游验证过 `nfc-list`
-及 `mfoc` 默认密钥字典阶段；真正的 nested / DarkSide 攻击尚未在该硬件上完成实测。
+及 `mfoc` 默认密钥字典阶段；真正的 nested / DarkSide 攻击尚未通过桥接在该硬件上完成实测
+（原生进程内引擎使用相同攻击流程直接访问读卡器）。
 对 `SAK 19 + ATQA 0004 + 4 字节 UID`，桥接仅在返回给不认识 SAK 19 的旧 libnfc 工具时把
 寻卡响应中的 SAK 映射为标准 1K 的 `08`；应用内记录和实体卡始终保持原始 `19`。
 

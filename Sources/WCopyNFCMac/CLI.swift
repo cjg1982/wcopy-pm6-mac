@@ -110,7 +110,7 @@ struct CLICommandResult {
 
 enum WCopyCLI {
     static let schemaVersion = 1
-    static let version = "1.3.0"
+    static let version = "1.4.0"
     private static let deviceValueOptions: Set<String> = ["device-id", "device-index", "sync-radius"]
     private static let commonFlags: Set<String> = ["pretty", "verbose"]
     private static let cancellationToken = CancellationToken()
@@ -175,6 +175,7 @@ enum WCopyCLI {
         case "card-info": return try cardInfoCommand(options)
         case "read": return try readCommand(options)
         case "keys": return try keysCommand(options)
+        case "recover": return try recoverCommand(options)
         case "verify-key": return try verifyKeyCommand(options)
         case "restore": return try restoreCommand(options)
         case "write-uid": return try writeUIDCommand(options)
@@ -205,6 +206,7 @@ enum WCopyCLI {
                 commandCapability("card-info", mutating: false, hardware: true),
                 commandCapability("read", mutating: false, hardware: true),
                 commandCapability("keys", mutating: false, hardware: true),
+                commandCapability("recover", mutating: false, hardware: true),
                 commandCapability("verify-key", mutating: false, hardware: true),
                 commandCapability("restore", mutating: true, hardware: true),
                 commandCapability("write-uid", mutating: true, hardware: true),
@@ -429,6 +431,188 @@ enum WCopyCLI {
         )
     }
 
+    /// Native mfoc-style key recovery: dictionary check first, then nested-auth
+    /// recovery for any remaining key slots, all in-process.
+    private static func recoverCommand(_ options: CLIOptions) throws -> CLICommandResult {
+        try options.validate(
+            valueOptions: deviceValueOptions.union(["card-mode", "dictionary", "key", "key-file", "preset", "probes", "sectors"]),
+            flagOptions: commonFlags,
+            repeatableValueOptions: ["dictionary", "key"]
+        )
+        let mode = try parseCardMode(options.value("card-mode"))
+        let preset = try dictionaryPreset(options.value("preset"))
+        var customKeys = try options.allValues("key").map(normalizeMifareKey)
+        var dictionaryStats: [[String: Any]] = []
+        for path in options.allValues("dictionary") {
+            let url = fileURL(path)
+            let text: String
+            do { text = try String(contentsOf: url, encoding: .utf8) }
+            catch { throw CLIError.file("无法读取词典 \(url.path)：\(error.localizedDescription)") }
+            let parsed = MifareKeyDictionary.parse(text)
+            customKeys.append(contentsOf: parsed.keys)
+            dictionaryStats.append([
+                "path": url.path,
+                "keys": parsed.keys.count,
+                "duplicates": parsed.duplicateCount,
+                "ignoredLines": parsed.ignoredLines
+            ])
+        }
+        let candidates = MifareKeyDictionary.merged([preset.keys, customKeys])
+        let probes = try probesCount(options.value("probes"))
+        let requestedSectors = try options.value("sectors").map { try parseSectors($0, maximum: 39) }
+
+        let outcome = try withReader(options) { reader, _, _, _ in
+            let check = try reader.checkKeys(
+                candidates: candidates,
+                scanMode: mode,
+                progress: progressLogger(options),
+                token: cancellationToken
+            )
+            let target = check.target
+            guard target.kind != .unknown else {
+                throw AppError.unsupported("检测到 \(target.kind.rawValue)，Nested 恢复仅支持 MIFARE Classic Mini / 1K / 2K / 4K")
+            }
+            var sectorKeys = check.sectorKeys
+            let verbose = options.hasFlag("verbose")
+            let session = NestedRecoverySession(
+                transport: reader,
+                target: target,
+                logger: { if verbose { log($0) } }
+            )
+
+            let exploits: [(sector: Int, keyHex: String, type: KeyType)] = sectorKeys.values
+                .sorted { $0.sector < $1.sector }
+                .flatMap { result -> [(Int, String, KeyType)] in
+                    var entries: [(Int, String, KeyType)] = []
+                    if let keyA = result.keyA { entries.append((result.sector, keyA, .a)) }
+                    if let keyB = result.keyB, result.keyBAuthenticates != false { entries.append((result.sector, keyB, .b)) }
+                    return entries
+                }
+            let missingSlots: [(sector: Int, type: KeyType)] = sectorKeys.values
+                .sorted { $0.sector < $1.sector }
+                .flatMap { result -> [(Int, KeyType)] in
+                    guard requestedSectors == nil || requestedSectors!.contains(result.sector) else { return [] }
+                    var slots: [(Int, KeyType)] = []
+                    if result.keyA == nil { slots.append((result.sector, .a)) }
+                    if result.keyB == nil, result.keyBAuthenticates != false { slots.append((result.sector, .b)) }
+                    return slots
+                }
+
+            var recovered: [(sector: Int, type: KeyType, keyHex: String)] = []
+            for slot in missingSlots {
+                guard !exploits.isEmpty else { break }
+                var found = false
+                for exploit in exploits {
+                    try cancellationToken.check()
+                    guard let exploitKey = try? HexCodec.data(from: exploit.keyHex, expectedBytes: 6) else { continue }
+                    do {
+                        let candidateKeys = try session.recoverKey(
+                            exploitSector: exploit.sector,
+                            exploitKey: exploitKey,
+                            exploitType: exploit.type,
+                            targetSector: slot.sector,
+                            targetType: slot.type,
+                            probes: probes,
+                            progress: progressLogger(options),
+                            token: cancellationToken
+                        )
+                        for candidate in candidateKeys.prefix(50) {
+                            try cancellationToken.check()
+                            guard let keyBytes = try? HexCodec.data(from: candidate, expectedBytes: 6),
+                                  try reader.authenticate(
+                                      block: CardLayout.firstBlock(of: slot.sector),
+                                      uid: target.uid,
+                                      key: keyBytes,
+                                      type: slot.type
+                                  ) else { continue }
+                            recovered.append((slot.sector, slot.type, candidate))
+                            if slot.type == .a {
+                                revealKeyB(&sectorKeys, sector: slot.sector, keyA: candidate, reader: reader, target: target)
+                            }
+                            found = true
+                            break
+                        }
+                    } catch {
+                        if verbose { log("扇区 \(slot.sector) Key \(slot.type.rawValue) 使用入口 \(exploit.keyHex) 失败：\(error.localizedDescription)") }
+                    }
+                    if found { break }
+                }
+            }
+            return RecoveryOutcome(
+                target: target,
+                check: check,
+                sectorKeys: sectorKeys,
+                recovered: recovered,
+                dictionaryStats: dictionaryStats,
+                probes: probes
+            )
+        }
+
+        let sortedKeys = outcome.sectorKeys.values.sorted { $0.sector < $1.sector }
+        let remaining = sortedKeys.reduce(0) {
+            $0 + ($1.keyA == nil ? 1 : 0) + ($1.keyB == nil && $1.keyBAuthenticates != false ? 1 : 0)
+        }
+        let foundSlots = sortedKeys.reduce(0) { $0 + ($1.keyA == nil ? 0 : 1) + ($1.keyB == nil ? 0 : 1) }
+        let data: [String: Any] = [
+            "card": targetObject(outcome.target),
+            "seedKeyCandidates": outcome.check.candidateCount,
+            "authenticationAttempts": outcome.check.attempts,
+            "probesPerSlot": outcome.probes,
+            "foundSlots": foundSlots,
+            "totalSlots": sortedKeys.count * 2,
+            "recoveredSlots": outcome.recovered.map { [
+                "sector": $0.sector,
+                "keyType": $0.type.rawValue,
+                "key": $0.keyHex
+            ] },
+            "sectorKeys": sortedKeys.map(sectorKeyObject),
+            "dictionaryFiles": outcome.dictionaryStats
+        ]
+        return CLICommandResult(
+            data: data,
+            exitCode: remaining == 0 ? CLIExitCode.success : CLIExitCode.partialResult
+        )
+    }
+
+    private struct RecoveryOutcome {
+        let target: CardTarget
+        let check: KeyCheckOutcome
+        let sectorKeys: [Int: SectorKeyResult]
+        let recovered: [(sector: Int, type: KeyType, keyHex: String)]
+        let dictionaryStats: [[String: Any]]
+        let probes: Int
+    }
+
+    private static func probesCount(_ value: String?) throws -> Int {
+        guard let value else { return 20 }
+        guard let probes = Int(value), probes > 0, probes <= 500 else {
+            throw CLIError.usage("--probes 必须是 1...500 之间的整数")
+        }
+        return probes
+    }
+
+    private static func revealKeyB(
+        _ sectorKeys: inout [Int: SectorKeyResult],
+        sector: Int,
+        keyA: String,
+        reader: WCopyReader,
+        target: CardTarget
+    ) {
+        let trailer = CardLayout.trailerBlock(of: sector)
+        guard let keyData = try? HexCodec.data(from: keyA, expectedBytes: 6),
+              (try? reader.authenticate(block: trailer, uid: target.uid, key: keyData, type: .a)) == true,
+              let trailerData = try? reader.readBlock(trailer) else {
+            return
+        }
+        let revealed = HexCodec.string(trailerData.suffix(6))
+        let authenticates = (try? HexCodec.data(from: revealed, expectedBytes: 6))
+            .map { (try? reader.authenticate(block: trailer, uid: target.uid, key: $0, type: .b)) ?? false } ?? false
+        var result = sectorKeys[sector] ?? SectorKeyResult(sector: sector)
+        result.keyB = revealed
+        result.keyBAuthenticates = authenticates
+        sectorKeys[sector] = result
+    }
+
     private static func verifyKeyCommand(_ options: CLIOptions) throws -> CLICommandResult {
         try options.validate(
             valueOptions: deviceValueOptions.union(["card-mode", "key", "key-file", "key-type", "sector"]),
@@ -641,17 +825,15 @@ enum WCopyCLI {
 
     private static func dictionaryPreset(_ value: String?) throws -> KeyDictionaryPreset {
         switch value?.lowercased() ?? "common" {
-        case "quick": return .quick
         case "common": return .common
         case "patterns": return .patterns
         case "custom", "none": return .customOnly
-        default: throw CLIError.usage("--preset 必须是 quick、common、patterns 或 custom")
+        default: throw CLIError.usage("--preset 必须是 common、patterns 或 custom")
         }
     }
 
     private static func presetName(_ preset: KeyDictionaryPreset) -> String {
         switch preset {
-        case .quick: return "quick"
         case .common: return "common"
         case .patterns: return "patterns"
         case .customOnly: return "custom"
@@ -931,10 +1113,18 @@ enum WCopyCLI {
             """
         case "keys":
             text = """
-            Usage: wcopy-nfc keys [--preset quick|common|patterns|custom]
+            Usage: wcopy-nfc keys [--preset common|patterns|custom]
                    [--dictionary FILE]... [--key HEX]... [--card-mode MODE]
                    [--output FILE] [--format json|mfd]
             Checks Key A and Key B for every sector and returns all discovered slots.
+            """
+        case "recover":
+            text = """
+            Usage: wcopy-nfc recover [--preset common|patterns|custom]
+                   [--dictionary FILE]... [--key HEX]... [--card-mode MODE]
+                   [--sectors RANGE] [--probes N]
+            Checks dictionary keys, then recovers remaining key slots in-process
+            with the native nested-authentication attack (no mfoc required).
             """
         case "restore":
             text = """
@@ -971,6 +1161,7 @@ enum WCopyCLI {
             Card operations:
               read            Read sectors with one known key
               keys            Check dictionary candidates against all key slots
+              recover         Recover missing keys with the native nested attack
               verify-key      Verify one key against one sector/key type
               restore         Restore a JSON/MFD dump; requires --yes
               write-uid       Change a Magic/CUID card UID; requires --yes

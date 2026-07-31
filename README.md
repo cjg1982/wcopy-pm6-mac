@@ -11,10 +11,17 @@ The app supports both **English and Chinese**, detecting the system language aut
 
 ## Device Support
 
+![wCopy NFC reader](docs/images/reader.png)
+
 | VID:PID | Status |
 | --- | --- |
 | `0416:b008` | HID sequence sync and init handshake verified on `wCopy NSR106-IDIC V601` hardware |
 | `0416:b030` | Validated by upstream on real Linux hardware; same protocol, native macOS implementation |
+
+Readers of the same family that expose the same wCopy USB‑HID protocol
+(`0416:b008` / `0416:b030`) are supported as well — the app detects them by the
+64‑byte HID interface, so other wCopy / NSR106‑IDIC‑style NFC reader units work
+without modification.
 
 USB enumeration and protocol compatibility are displayed separately. A detected device does
 not mean the protocol is ready — only after serial number sync and the four‑step
@@ -40,6 +47,8 @@ preserves diagnostic info rather than reporting a false connection.
   verification.
 - Format specified sectors while preserving manufacturer block 0.
 - Native raw PTY bridge for running `nfc-list`, `mfoc`, `mfcuk`.
+- **Native nested‑authentication key recovery**: an in‑process reimplementation of the
+  mfoc Crypto1 / nested attack that recovers unknown keys without installing mfoc.
 - HID descriptor, handshake, log, and raw PN532 command diagnostics.
 - Agent‑friendly `wcopy-nfc` CLI with stable JSON output, exit codes, read‑only /
   write safety boundaries, and no‑interaction parameters.
@@ -93,7 +102,7 @@ Release CLI examples:
 ./dist/wcopy-nfc devices --pretty
 ./dist/wcopy-nfc reader-info --pretty
 ./dist/wcopy-nfc card-info --card-mode auto --pretty
-./dist/wcopy-nfc keys --preset quick --card-mode 1k --pretty
+./dist/wcopy-nfc keys --preset common --card-mode 1k --pretty
 ```
 
 See [`docs/CLI.md`](docs/CLI.md) for the full command set, JSON schema, exit codes,
@@ -111,16 +120,16 @@ the same HID interface, then re‑plug the reader.
 4. Go to "Read & Backup" and save a JSON dump. Note that MIFARE hardware hides Key A
    in the trailer blocks; you need a key‑check pass to obtain full A/B keys before
    safely exporting a complete MFD or restoring trailer blocks.
-5. If authentication fails, use "Key Check"; for unknown keys, use the `mfoc` bridge.
+5. If authentication fails, use "Key Check"; for unknown keys, use the native nested
+   recovery on the "Key Recovery" page (no mfoc needed) or the external `mfoc` bridge.
 
 ## Default Key Dictionaries
 
 The "default key check" is not a brute‑force scan of the full 48‑bit key space. The app
 only tries a user‑selected candidate set:
 
-- Quick defaults: 13 high‑hit defaults matching the `mfoc` default set.
-- Common public keys: an independently curated list of common defaults, test values,
-  and publicly deployed keys.
+- Common public keys: an independently curated list of common defaults (including the
+  `mfoc` high‑hit set), test values, and publicly deployed keys.
 - Weak‑mode extension: extends the common set with repeat‑byte, sequential‑increment,
   and sequential‑decrement patterns.
 - Custom wordlists: supports Proxmark3 `.dic`, MIFARE Classic Tool `.keys`, and plain text.
@@ -187,14 +196,28 @@ static interpretation of the access bits. Other combinations are not asserted as
 specific vendor or chip model based solely on SAK.
 
 Public default keys can only discover static defaults or weak passwords. Truly random,
-UID‑derived, or unknown keys require authorized `mfoc`/`mfcuk` nested or DarkSide
-workflows; feasibility depends on the card's PRNG and the reader firmware capability.
+UID‑derived, or unknown keys require an authorized nested / DarkSide attack. This project
+now ships a **native** reimplementation of the mfoc Crypto1 cipher and nested
+authentication attack (LFSR state recovery, PRNG distance measurement, and keystream
+recovery) that runs in‑process against the reader's raw bit frames, so it works without
+installing mfoc or going through the PTY bridge. Feasibility still depends on the card's
+PRNG and the reader firmware capability; the external `mfoc` remains available as an
+alternative through the optional libnfc bridge.
+
+After the dictionary check leaves key slots unresolved, the recovery page picks each known
+key in turn as an attack entry, measures nonce distances, recovers candidate LFSR states,
+and verifies every candidate against the card before recording it. When a sector's Key A
+is recovered, the trailer is read to reveal a readable Key B field and test whether it can
+authenticate. The same engine is exposed as `wcopy-nfc recover`.
 
 The device protocol is sensitive to error sequences. If HID is detected but syncing fails,
 unplug the reader for a few seconds and reconnect. Do not move the card or unplug the
 reader during write or format operations.
 
 ## Optional libnfc Tools
+
+The native nested recovery and the `recover` CLI command do not require libnfc or mfoc.
+The optional external tools are still available for advanced bridge use:
 
 ```bash
 brew install libnfc mfoc mfcuk
@@ -207,7 +230,8 @@ synchronizes and initializes the reader, creates the PTY, and sets
 The GUI batches bridge output and omits high-frequency frame previews so long mfoc recovery
 runs do not block the interface; key results, progress, warnings, and errors remain visible.
 Upstream has verified `nfc-list` and the `mfoc` default‑key dictionary phase; true
-nested / DarkSide attacks have not yet been tested on this hardware.
+nested / DarkSide attacks have not yet been tested on this hardware through the bridge
+(the native in‑process engine uses the same attack flow directly against the reader).
 
 For `SAK 19 + ATQA 0004 + 4‑byte UID` cards, the bridge remaps the SAK in the
 anti‑collision response to the standard 1K value `08` only when communicating with

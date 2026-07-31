@@ -277,7 +277,7 @@ rm -f /tmp/wcopy.key
 按候选命中概率逐扇区检查 Key A 和 Key B，并尽可能读取数据块。
 
 ```bash
-./dist/wcopy-nfc keys --preset quick --card-mode 1k --pretty
+./dist/wcopy-nfc keys --preset common --card-mode 1k --pretty
 
 ./dist/wcopy-nfc keys \
   --preset common \
@@ -293,8 +293,7 @@ rm -f /tmp/wcopy.key
 
 | 值 | 内容 |
 | --- | --- |
-| `quick` | mfoc 常用的 13 个高命中默认键 |
-| `common` | 默认值、常见公开键和测试键；默认值 |
+| `common` | 默认值、常见公开键和测试键（含 mfoc 高命中默认集）；默认值 |
 | `patterns` | common 加重复字节、递增和递减弱模式 |
 | `custom` | 只使用 `--dictionary` 和 `--key` |
 
@@ -317,6 +316,47 @@ rm -f /tmp/wcopy.key
 但不能用于 Key B 认证。Agent 不应把它传给 `verify-key --key-type B`。
 
 静态词典检查不是完整 48 位密钥穷举。UID 派生、随机或未知密钥不会因为增加运行时间而必然找到。
+
+### `recover`
+
+在进程内完成词典检查，然后对仍未解决的密钥槽执行 Nested 认证攻击（mfoc 的核心算法），恢复
+未知密钥。不需要安装 mfoc，也不经过 PTY 桥接。
+
+```bash
+./dist/wcopy-nfc recover \
+  --preset common \
+  --card-mode 1k \
+  --sectors 0-15 \
+  --probes 20 \
+  --verbose
+```
+
+参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `--preset` / `--dictionary` / `--key` | 与 `keys` 相同的候选来源；先执行词典检查 |
+| `--sectors RANGE` | 只对指定扇区尝试恢复，默认全部扇区 |
+| `--probes N` | 每个目标密钥槽的探测轮数，`1...500`，默认 `20` |
+
+流程与 mfoc 一致：先用候选词典逐扇区检查 Key A/B，然后按扇区顺序用每个已知密钥作为攻击入口，
+收集 nonce 距离取中位数，再通过 32 位密钥流恢复 LFSR 状态并回滚得到候选密钥，最后逐一在卡片上
+验证。恢复出 Key A 后会自动读取尾块，揭示可读的 Key B 字段并测试其是否可认证。
+
+主要字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `recoveredSlots[]` | 新恢复的 `sector`、`keyType` 和 `key` |
+| `sectorKeys[]` | 最终每个扇区的 `keyA`、`keyB` 和 `keyBAuthenticates` |
+| `foundSlots` / `totalSlots` | 词典 + 恢复后已确定的 A/B 槽数量 |
+| `probesPerSlot` | 本次使用的探测轮数 |
+
+全部密钥槽解决时退出 `0`；仍有未解决槽时退出 `10`，此时 `data` 仍是可解析的部分结果。恢复需要
+至少一个可认证密钥作为入口；`recover` 本身不会修改卡片（`recoveredSlots` 只记录验证结果）。
+
+Nested 攻击依赖卡片 PRNG 可预测性。非 MIFARE 卡、已锁定的 SAK 19 兼容布局或 PRNG 行为异常的
+卡片可能无法恢复。`--probes` 增加成功概率，也线性增加运行时间。
 
 ### `verify-key`
 
@@ -434,13 +474,24 @@ MFD 标准大小自动识别。
 ```bash
 ./dist/wcopy-nfc keys \
   --device-index 0 \
-  --preset quick \
+  --preset common \
   --card-mode 1k \
   --output /tmp/card.json
 status=$?
 if [ "$status" -ne 0 ] && [ "$status" -ne 10 ]; then
   exit "$status"
 fi
+```
+
+密钥不完整时的恢复流程（只读，不修改卡片）：
+
+```bash
+./dist/wcopy-nfc recover \
+  --device-index 0 \
+  --preset common \
+  --card-mode 1k \
+  --probes 20
+# 退出 10 表示仍有未解决槽，data.recoveredSlots 已包含验证通过的恢复结果
 ```
 
 Agent 决策规则：
@@ -476,7 +527,7 @@ Agent 决策规则：
 
 `keys` 长时间运行：
 
-- 先用 `--preset quick`。
+- 先用 `--preset common`。
 - 确有需要再使用 `common`、`patterns` 或大型导入词典。
 - 候选数量乘以未解决密钥槽数决定认证量；大词典可能需要很长时间。
 - 扫描期间保持卡片稳定，CLI 会在认证失败后重新寻卡并核对 UID、ATQA、SAK。

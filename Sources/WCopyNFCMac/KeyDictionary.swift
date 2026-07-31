@@ -1,7 +1,6 @@
 import Foundation
 
 enum KeyDictionaryPreset: String, CaseIterable, Identifiable {
-    case quick = "快速默认键"
     case common = "常用公开键"
     case patterns = "弱模式扩展"
     case customOnly = "仅自定义"
@@ -10,10 +9,8 @@ enum KeyDictionaryPreset: String, CaseIterable, Identifiable {
 
     var detail: String {
         switch self {
-        case .quick:
-            return "mfoc 使用的 13 个高命中默认键"
         case .common:
-            return "默认键、常见测试键及公开部署键"
+            return "默认键、常见测试键及公开部署键（含 mfoc 高命中默认集）"
         case .patterns:
             return "常用公开键，加重复字节、递增和递减弱模式"
         case .customOnly:
@@ -23,7 +20,6 @@ enum KeyDictionaryPreset: String, CaseIterable, Identifiable {
 
     var keys: [String] {
         switch self {
-        case .quick: return MifareKeyDictionary.quickKeys
         case .common: return MifareKeyDictionary.commonKeys
         case .patterns: return MifareKeyDictionary.weakPatternKeys
         case .customOnly: return []
@@ -70,7 +66,7 @@ enum MifareKeyDictionary {
     private static let keyRegex = try! NSRegularExpression(
         pattern: "(?i)(?<![0-9a-f])(?:0x)?([0-9a-f]{12})(?![0-9a-f])"
     )
-    // The compact default set used by mfoc and many compatible tools.
+    // The mfoc 高命中默认集，作为常用公开键的基集。
     static let quickKeys = [
         "FFFFFFFFFFFF", "A0A1A2A3A4A5", "D3F7D3F7D3F7",
         "000000000000", "B0B1B2B3B4B5", "4D3A99C351DD",

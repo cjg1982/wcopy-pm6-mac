@@ -735,7 +735,38 @@ final class WCopyReader {
         guard bytes.count >= 2, bytes.first == 0xD4 else {
             throw AppError.operation("PN532 主机命令必须以 D4 开头")
         }
-        return try pn532(bytes, timeout: 2)
+        let cmdName = pn532CommandName(bytes)
+        let startSeq = sequence
+        let start = Date()
+        do {
+            let response = try pn532(bytes, timeout: 2)
+            let elapsed = Date().timeIntervalSince(start)
+            let respHex = response.prefix(16).map { String(format: "%02X", $0) }.joined(separator: " ")
+            logger("[PN532] \(cmdName) seq=\(String(format:"0x%04X", startSeq ?? 0)) → seq=\(String(format:"0x%04X", sequence ?? 0)) \(String(format:"%.0fms", elapsed*1000)) rx=\(respHex)")
+            return response
+        } catch {
+            let elapsed = Date().timeIntervalSince(start)
+            logger("[PN532] \(cmdName) seq=\(String(format:"0x%04X", startSeq ?? 0)) FAIL \(String(format:"%.0fms", elapsed*1000)): \(error.localizedDescription)")
+            throw error
+        }
+    }
+
+    private func pn532CommandName(_ cmd: Data) -> String {
+        guard cmd.count >= 2 else { return "?" }
+        switch cmd[1] {
+        case 0x02: return "GetFirmware"
+        case 0x04: return "GetGeneralStatus"
+        case 0x06: return "ReadRegister"
+        case 0x08: return "WriteRegister"
+        case 0x12: return "SetParameters"
+        case 0x14: return "SAMConfig"
+        case 0x32: return "RFConfig"
+        case 0x40: return "InDataExchange"
+        case 0x42: return "InCommunicateThru"
+        case 0x4A: return "InListPassiveTarget"
+        case 0x4C: return "InJumpForDEP"
+        default: return "D4_\(String(format:"%02X", cmd[1]))"
+        }
     }
 
     private func exchange(_ outboundSequence: UInt16, content: Data, timeout: TimeInterval) throws -> Data? {
@@ -767,7 +798,7 @@ final class WCopyReader {
         return try send(wrapped, timeout: timeout)
     }
 
-    private func authenticate(block: Int, uid: Data, key: Data, type: KeyType) throws -> Bool {
+    func authenticate(block: Int, uid: Data, key: Data, type: KeyType) throws -> Bool {
         guard block >= 0, block <= 255 else { return false }
         var command = Data([0xD4, 0x40, 0x01, type.command, UInt8(block)])
         command.append(key)
@@ -847,7 +878,7 @@ final class WCopyReader {
         )
     }
 
-    private func readBlock(_ block: Int) throws -> Data? {
+    func readBlock(_ block: Int) throws -> Data? {
         let response = try pn532(Data([0xD4, 0x40, 0x01, 0x30, UInt8(block)]))
         guard response.count >= 19, response[0] == 0xD5, response[2] == 0 else { return nil }
         return response.subdata(in: 3..<19)
@@ -891,5 +922,87 @@ final class WCopyReader {
             return value
         }
         return HexCodec.string(data, separator: " ")
+    }
+}
+
+// MARK: - Raw PN532 control for nested recovery
+
+extension WCopyReader: NestedRecoveryTransport {
+    func readRegister(_ address: UInt16) throws -> UInt8 {
+        let cmd = Data([0xD4, 0x06, UInt8(address >> 8), UInt8(address & 0xFF)])
+        let response = try pn532(cmd, timeout: 2)
+        guard response.count >= 2, response[0] == 0xD5, response[1] == 0x07 else {
+            throw AppError.operation("PN532 ReadRegister 失败")
+        }
+        return response[2]
+    }
+
+    func writeRegister(_ address: UInt16, value: UInt8) throws {
+        let cmd = Data([0xD4, 0x08, UInt8(address >> 8), UInt8(address & 0xFF), value])
+        let response = try pn532(cmd, timeout: 2)
+        guard response.count >= 2, response[0] == 0xD5, response[1] == 0x09 else {
+            throw AppError.operation("PN532 WriteRegister 失败")
+        }
+    }
+
+    func setParameters(flags: UInt8) throws -> Data {
+        let cmd = Data([0xD4, 0x12, flags])
+        let response = try pn532(cmd, timeout: 2)
+        guard response.count >= 2, response[0] == 0xD5, response[1] == 0x13 else {
+            throw AppError.operation("PN532 SetParameters 失败")
+        }
+        return response
+    }
+
+    private func rfConfiguration(item: UInt8, config: Data) throws -> Data {
+        var cmd = Data([0xD4, 0x32, item])
+        cmd.append(config)
+        let response = try pn532(cmd, timeout: 2)
+        guard response.count >= 2, response[0] == 0xD5, response[1] == 0x33 else {
+            throw AppError.operation("PN532 RFConfiguration 失败")
+        }
+        return response
+    }
+
+    func inCommunicateThru(tx: Data, timeout: TimeInterval = 1.0) throws -> Data {
+        guard tx.count <= 265 else { throw AppError.operation("InCommunicateThru: 发送数据过长") }
+        var cmd = Data([0xD4, 0x42])
+        cmd.append(tx)
+        let response = try pn532(cmd, timeout: timeout)
+        guard response.count >= 3, response[0] == 0xD5, response[1] == 0x43 else {
+            throw AppError.operation("PN532 InCommunicateThru 失败")
+        }
+        let status = response[2]
+        guard status == 0x00 else {
+            logger("[RECOVERY] InCommunicateThru 失败 tx=\(HexCodec.string(tx)) status=0x\(String(format: "%02X", status)) resp=\(HexCodec.string(response))")
+            throw AppError.operation("PN532 InCommunicateThru 超时或无卡")
+        }
+        var rx = response.subdata(in: 3..<response.count)
+        if rx.suffix(2) == Data([0x90, 0x00]) {
+            rx.removeLast(2)
+        }
+        return rx
+    }
+
+    /// Send raw RF bits with explicit per-byte parity via InCommunicateThru and
+    /// recover the received raw bits plus their parity bits. Mirrors the
+    /// transceive_bits framing used by libnfc for the nested attack.
+    func transceiveRawBits(
+        data: Data,
+        parity: [UInt8],
+        timeout: TimeInterval = 1.5
+    ) throws -> (data: Data, parity: [UInt8]) {
+        guard !data.isEmpty, data.count <= 32 else {
+            throw AppError.operation("InCommunicateThru: 原始数据长度非法")
+        }
+        let dataBits = data.count * 8
+        let frameBits = MifareBitFraming.frameBits(forDataBits: dataBits)
+        let wrapped = MifareBitFraming.wrapFrame(data: data, parity: parity)
+        let currentFraming = (try readRegister(0x633D)) & ~UInt8(0x07)
+        try writeRegister(0x633D, value: currentFraming | UInt8(frameBits % 8))
+        let rx = try inCommunicateThru(tx: wrapped, timeout: timeout)
+        let lastRxBits = Int((try readRegister(0x633C)) & 0x07)
+        let rxFrameBits = (rx.count - (lastRxBits == 0 ? 0 : 1)) * 8 + lastRxBits
+        return MifareBitFraming.unwrapFrame(frame: rx, frameBits: rxFrameBits)
     }
 }

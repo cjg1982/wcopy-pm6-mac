@@ -28,14 +28,20 @@ Only operate on cards owned by the user or explicitly authorized for testing.
 - `Sources/WCopyNFCMac/Views.swift`: SwiftUI pages and controls.
 - `Sources/WCopyNFCMac/HIDTransport.swift`: IOKit HID discovery and transport.
 - `Sources/WCopyNFCMac/WCopyReader.swift`: wCopy framing, PN532, MIFARE, read,
-  key checking, restore, UID, format, and mfoc recovery orchestration.
+  key checking, restore, UID, format, and raw PN532 recovery primitives.
+- `Sources/WCopyNFCMac/Crypto1.swift`: native Crypto1 cipher, PRNG, LFSR state
+  recovery/rollback, and CRC-A; pinned to mfoc/crapto1 behavior by tests.
+- `Sources/WCopyNFCMac/NestedRecovery.swift`: native mfoc-style nested-auth key
+  recovery session and the raw bit-framing transport surface.
 - `Sources/WCopyNFCMac/LibNFCBridge.swift`: PTY-based PN532 UART bridge for
-  libnfc tools.
+  optional libnfc tools.
 - `Sources/WCopyNFCMac/Models.swift`: card geometry, dumps, keys, errors, and
   shared data types.
 - `Sources/WCopyNFCMac/KeyDictionary.swift`: built-in and imported key sets.
 - `Sources/WCopyNFCMac/CLI.swift`: CLI parsing, JSON schema, commands, and exits.
 - `Tests/WCopyNFCMacTests/ProtocolTests.swift`: protocol and model unit tests.
+- `Tests/WCopyNFCMacTests/Crypto1Tests.swift`: reference vectors and a
+  simulated-card nested-attack end-to-end test.
 - `Scripts/build-app.sh`: signed Release App Bundle and CLI build.
 - `docs/CLI.md`: public CLI contract and agent usage rules.
 
@@ -136,17 +142,41 @@ only a matching `D5 4B` target response from SAK `19` to `08`. Never modify the
 physical card, internal `CardTarget`, JSON metadata, or unrelated target
 responses as part of this compatibility mapping.
 
-## Key Discovery and mfoc Recovery
+## Key Discovery and Recovery
 
 Dictionary checking and cryptographic recovery are different operations:
 
 1. Check selected dictionary candidates against unresolved Key A/Key B slots.
-2. Return and display the dictionary result without starting mfoc automatically.
+2. Return and display the dictionary result without starting recovery
+   automatically.
 3. In the GUI, if slots remain unresolved, show the recovery prompt. Confirming
-   it navigates to the mfoc page; the user starts recovery manually there.
-4. After manual recovery succeeds, parse the produced MFD, merge only previously
-   missing keys, and retain the card geometry expected by the detected target.
+   it navigates to the recovery page; the user starts recovery manually there.
+4. After recovery succeeds, merge only previously missing keys and retain the
+   card geometry expected by the detected target.
 
+The default recovery engine is **native** (`NestedRecoverySession` in
+`NestedRecovery.swift`): an in-process reimplementation of the mfoc nested-auth
+attack. It drives the reader through raw PN532 bit frames (CIU register pokes +
+`InCommunicateThru`) and does not require libnfc or mfoc. `Crypto1.swift`
+provides the cipher, PRNG distance measurement, and LFSR state recovery, pinned
+to mfoc/crapto1 reference vectors by `Crypto1Tests.swift`. A simulated-card
+unit test exercises the whole attack without hardware.
+
+Native recovery flow (shared by the GUI "原生恢复" button and the CLI
+`wcopy-nfc recover` command):
+
+- Use every known authenticating key in sector order as an attack entry; a
+  verified entry stops the search for that slot.
+- Measure nested nonce distances, take the median, then recover candidate
+  LFSR states within the tolerance window and verify every candidate against
+  the card before recording it.
+- After a Key A is recovered, read the trailer with Key A to reveal a readable
+  Key B field and test whether it can authenticate.
+- Keep cancellation checks in distance, recovery, and candidate loops.
+- Preserve the reader in a normal (CRC/parity on) state before returning so
+  later `authenticate`/`readBlock` calls work.
+
+The external `mfoc` via `LibNFCBridge` remains available as an advanced option.
 For the verified SAK 19 card with UID `48C8403C`, the working bridge command is
 equivalent to:
 
@@ -154,11 +184,11 @@ equivalent to:
 mfoc -k A0A1A2A3A4A5 -O /absolute/path/to/output.mfd
 ```
 
-The recovery UI must preserve these constraints:
+External mfoc constraints (bridge path only):
 
 - Pass one known authenticating seed key, preferably the first known Key A in
   sector order. Do not pass every discovered key to mfoc.
-- Additionally pass any non-quick dictionary keys discovered during the scan
+- Additionally pass any discovered dictionary keys beyond the first seed
   (e.g., UID-derived keys for SAK 19 cards) so that mfoc can authenticate all
   sectors during the dictionary phase and skip the attack-phase transition
   that may fail the same `select_passive_target` call.
@@ -181,7 +211,7 @@ of a normal authentication-failure status, causing libnfc to report `Timeout`,
 `Unexpected PN53x reply`, or `Tag has been removed` even when the card remains
 physically present.
 
-When diagnosing mfoc behavior, compare the exact command printed after
+When diagnosing external mfoc behavior, compare the exact command printed after
 `libnfc bridge started`. If it contains multiple `-k` arguments, `-P 500`, or a
 relative `-O dump.mfd`, an old App Bundle is running or the verified flow has
 regressed.
@@ -192,8 +222,11 @@ mfoc/libnfc are optional runtime tools and may be installed with:
 brew install libnfc mfoc
 ```
 
-Do not vendor GPL key dictionaries or mfoc source into this MIT repository
-without an explicit licensing decision.
+Do not vendor GPL key dictionaries, mfoc source, or crapto1 source into this
+MIT repository without an explicit licensing decision. The native Crypto1 and
+nested-attack code is an original implementation of the published algorithm
+verified against reference behavior; keep it that way (no transliteration of
+GPL source).
 
 ## Dumps and Card Geometry
 

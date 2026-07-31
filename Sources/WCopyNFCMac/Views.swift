@@ -86,7 +86,7 @@ struct ContentView: View {
         .alert("密钥未全部找到", isPresented: $model.showMfocPrompt) {
             Button("确定") { model.goToMfocRecovery() }
         } message: {
-            Text("部分扇区密钥未能通过字典检测。点击确定前往 mfoc 密钥恢复页面，再手动开始补全。")
+            Text("部分扇区密钥未能通过字典检测。点击确定前往密钥恢复页面，再手动开始补全。")
         }
     }
 }
@@ -415,7 +415,7 @@ private struct ReadCardView: View {
                         TextField("扇区，例如 0-15", text: $sectors)
                             .disabled(readAll)
                         Button {
-                            model.readCard(
+                            model.readAndDetect(
                                 key: key,
                                 keyType: keyType,
                                 readAll: readAll,
@@ -423,12 +423,13 @@ private struct ReadCardView: View {
                                 scanMode: scanMode
                             )
                         } label: {
-                            Label("开始读取", systemImage: "wave.3.right.circle.fill")
+                            Label("自动检测并读取", systemImage: "wave.3.right.circle.fill")
                                 .frame(maxWidth: .infinity)
                         }
                         .buttonStyle(.borderedProminent)
                         .tint(brandTeal)
                         .disabled(!model.canOperate)
+                        .help("先用上方密钥直接读取；认证失败或未填密钥时，自动以该密钥 + 快速字典检测并读取。")
                     }
                     .formStyle(.grouped)
                 }
@@ -506,6 +507,29 @@ private struct DataPair: View {
             Text(label).foregroundStyle(.secondary)
             Spacer()
             Text(value).font(.callout.monospaced()).textSelection(.enabled)
+        }
+    }
+}
+
+/// 问号说明按钮：点击弹出气泡显示帮助文本。
+private struct InfoButton: View {
+    let text: String
+    @State private var showing = false
+
+    var body: some View {
+        Button {
+            showing.toggle()
+        } label: {
+            Image(systemName: "questionmark.circle")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .buttonStyle(.plain)
+        .popover(isPresented: $showing, arrowEdge: .bottom) {
+            Text(text)
+                .font(.callout)
+                .frame(maxWidth: 320, alignment: .leading)
+                .padding(12)
         }
     }
 }
@@ -597,7 +621,7 @@ private struct RestoreView: View {
                             }
                             HStack(spacing: 8) {
                                 Button("检测密钥") {
-                                    model.detectTargetKeys(scanMode: scanMode, preset: .quick) { _ in }
+                                    model.detectTargetKeys(scanMode: scanMode) { _ in }
                                 }.disabled(!model.canOperate)
                                 Button("导入文件") { importKeyFile() }
                                     .disabled(model.busy)
@@ -614,7 +638,7 @@ private struct RestoreView: View {
                     Form {
                         HStack {
                             SecureField("目标卡片密钥（留空使用转储密钥）", text: $keyOverride)
-                                        Button { } label: { Image(systemName: "questionmark.circle").font(.caption).foregroundStyle(.secondary) }.buttonStyle(.plain).help("当目标卡所有扇区使用同一个密钥时填写。单密钥优先于检测到的扇区密钥。")
+                                        InfoButton(text: "当目标卡所有扇区使用同一个密钥时填写。单密钥优先于检测到的扇区密钥。")
                         }
                         Picker("密钥类型", selection: $keyType) {
                             ForEach(KeyType.allCases) { Text("Key \($0.rawValue)").tag($0) }
@@ -623,7 +647,7 @@ private struct RestoreView: View {
                             Picker("目标卡型模式", selection: $scanMode) {
                                 ForEach(CardScanMode.allCases) { mode in Text(mode.rawValue).tag(mode) }
                             }
-                                        Button { } label: { Image(systemName: "questionmark.circle").font(.caption).foregroundStyle(.secondary) }.buttonStyle(.plain).help("仅改变软件使用的扇区/块几何，不修改卡片 SAK/ATQA/UID。")
+                                        InfoButton(text: "仅改变软件使用的扇区/块几何，不修改卡片 SAK/ATQA/UID。")
                         }
                         if let warning = scanMode.warning {
                             Text(warning).font(.caption).foregroundStyle(brandOrange)
@@ -631,15 +655,15 @@ private struct RestoreView: View {
                         Divider()
                         HStack {
                             Toggle("写后回读验证", isOn: $verify)
-                                        Button { } label: { Image(systemName: "questionmark.circle").font(.caption).foregroundStyle(.secondary) }.buttonStyle(.plain).help("写入后立即回读并比对，确保数据正确写入。建议保持开启。")
+                                        InfoButton(text: "写入后立即回读并比对，确保数据正确写入。建议保持开启。")
                         }
                         HStack {
                             Toggle("包含块 0 / UID（仅 Magic 卡）", isOn: $block0).tint(brandOrange)
-                                        Button { } label: { Image(systemName: "questionmark.circle").font(.caption).foregroundStyle(.secondary) }.buttonStyle(.plain).help("写入制造块。仅 CUID/Magic 卡支持，普通原装卡写入会失败。")
+                                        InfoButton(text: "写入制造块。仅 CUID/Magic 卡支持，普通原装卡写入会失败。")
                         }
                         HStack {
                             Toggle("包含扇区尾块（可能锁卡）", isOn: $trailers).tint(.red)
-                                        Button { } label: { Image(systemName: "questionmark.circle").font(.caption).foregroundStyle(.secondary) }.buttonStyle(.plain).help("改写每个扇区的密钥和访问位。错误访问位可能永久锁定扇区。操作前务必已有完整备份。")
+                                        InfoButton(text: "改写每个扇区的密钥和访问位。错误访问位可能永久锁定扇区。操作前务必已有完整备份。")
                         }
                         Button("开始恢复") { confirming = true }
                             .buttonStyle(.borderedProminent).tint(brandTeal)
@@ -852,7 +876,7 @@ private struct SectorKeyPanel: View {
     @EnvironmentObject private var model: AppModel
     @Binding var key: String
     @Binding var keyType: KeyType
-    @State private var preset: KeyDictionaryPreset = .quick
+    @State private var preset: KeyDictionaryPreset = .common
     @State private var customKeys = ""
     @State private var importedFileName = ""
     @State private var downloading = false
@@ -877,10 +901,7 @@ private struct SectorKeyPanel: View {
                     ForEach(KeyDictionaryPreset.allCases, id: \.self) { p in Text(p.rawValue).tag(p) }
                 }
                 .frame(width: 150)
-                Button { } label: {
-                    Image(systemName: "questionmark.circle").font(.caption).foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain).help(preset.detail)
+                InfoButton(text: preset.detail)
                 Spacer()
                 Menu {
                     ForEach(OnlineKeyDictionarySource.allCases) { source in
@@ -900,11 +921,7 @@ private struct SectorKeyPanel: View {
             }
             HStack(spacing: 4) {
                 Text("自定义密钥").font(.caption).foregroundStyle(.secondary)
-                Button { } label: {
-                    Image(systemName: "questionmark.circle").font(.caption2).foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                .help("支持 .dic、.keys、.txt 格式，每行可含注释或 0x 前缀。每行一个 6 字节密钥，自动去重。")
+                InfoButton(text: "支持 .dic、.keys、.txt 格式，每行可含注释或 0x 前缀。每行一个 6 字节密钥，自动去重。")
             }
             TextEditor(text: $customKeys)
                 .font(.system(size: 11, design: .monospaced))
@@ -1008,7 +1025,7 @@ private struct MfocRecoveryView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
-            PageHeader(eyebrow: "NESTED ATTACK", title: "mfoc 密钥恢复", subtitle: "利用已知密钥的 Nested 认证漏洞，恢复卡片中未被字典检测到的剩余密钥。需安装 mfoc。")
+            PageHeader(eyebrow: "NESTED ATTACK", title: "密钥恢复", subtitle: "利用已知密钥的 Nested 认证漏洞，在应用内原生恢复卡片中未被字典检测到的剩余密钥，无需安装 mfoc。")
 
             HStack(alignment: .top, spacing: 16) {
                 Surface {
@@ -1034,11 +1051,11 @@ private struct MfocRecoveryView: View {
                         Label("已知密钥", systemImage: "key.fill").font(.headline)
                         let knownKeys = knownKeyList
                         if knownKeys.isEmpty {
-                            Text("无已知密钥，mfoc 将使用内置默认字典扫描。").foregroundStyle(.secondary)
+                            Text("无已知密钥，无法作为 Nested 攻击入口。请先检测出至少一个可认证密钥。").foregroundStyle(.secondary)
                         } else {
                             Text(knownKeys.joined(separator: "  ")).font(.system(.callout, design: .monospaced)).textSelection(.enabled)
                         }
-                        Text("运行时只选择首个可认证密钥作为 mfoc nested 种子，避免重复扫描全部自定义密钥。")
+                        Text("恢复时依次用每个已知密钥尝试作为入口，成功后自动读取尾块并揭示可用的 Key B 字段。")
                             .font(.caption).foregroundStyle(.tertiary)
                     }
                 }
@@ -1046,8 +1063,22 @@ private struct MfocRecoveryView: View {
 
                 Surface {
                     VStack(alignment: .leading, spacing: 12) {
-                        HStack {
-                            Button("运行 mfoc") {
+                        HStack(spacing: 10) {
+                            Button("原生恢复") {
+                                model.clearLog()
+                                model.runNativeRecovery { _, _ in }
+                            }
+                            .buttonStyle(.borderedProminent).tint(brandTeal)
+                            .disabled(!model.canOperate)
+                            .help("使用已知扇区密钥直接在应用内执行 Nested 恢复，无需安装 mfoc。")
+                        }
+                        Text("原生恢复：内置 Crypto1 与 Nested 认证攻击，直接驱动读卡器原始位帧。无需 Homebrew，也不经过 CLI 桥接。")
+                            .font(.caption).foregroundStyle(.secondary)
+                        Divider()
+                        Text("高级：外部 mfoc（需 Homebrew）")
+                            .font(.caption).foregroundStyle(.tertiary)
+                        HStack(spacing: 10) {
+                            Button("运行外部 mfoc") {
                                 model.clearLog()
                                 let mfdPath = NSTemporaryDirectory() + "wcopy-mfoc-\(UUID().uuidString).mfd"
                                 let seedArg = mfocSeedKey.map { "-k \($0) " } ?? ""
@@ -1057,10 +1088,10 @@ private struct MfocRecoveryView: View {
                                     else { try? FileManager.default.removeItem(atPath: mfdPath) }
                                 }
                             }
-                            .buttonStyle(.borderedProminent).tint(brandTeal)
+                            .buttonStyle(.bordered)
                             .disabled(!model.canOperate)
                         }
-                        Text("仅将首个可认证密钥作为 nested 种子传给 mfoc，其余密钥由 mfoc 自行验证和恢复；完成后自动导入。")
+                        Text("外部 mfoc 仍可用作对照或补充；它通过 PTY 桥接访问读卡器。")
                             .font(.caption).foregroundStyle(.tertiary)
                     }
                 }

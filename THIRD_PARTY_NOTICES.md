@@ -45,5 +45,20 @@ project's license and notices.
 - MIFARE Classic Tool `extended-std.keys`: https://github.com/ikarus23/MifareClassicTool
 
 The compact built-in presets are independently curated from publicly known
-MIFARE defaults, test patterns, and generated weak patterns. The 13-key quick
-preset is interoperable with the default values conventionally tried by mfoc.
+MIFARE defaults, test patterns, and generated weak patterns. The common preset
+includes the default values conventionally tried by mfoc.
+
+## Native Crypto1 and nested-key recovery
+
+The in-process Crypto1 cipher, PRNG distance measurement, LFSR state recovery,
+and nested-authentication key recovery in `Crypto1.swift` and
+`NestedRecovery.swift` are an original implementation of the published MIFARE
+Classic Crypto1 algorithm and the mfoc nested-attack flow. They were written
+independently (no GPL source is vendored or transliterated) and pinned to the
+behavior of the reference `mfoc`/`crapto1` implementation by generated test
+vectors in `Crypto1Tests.swift`.
+
+- Reference behavior source (not redistributed):
+  https://github.com/nfc-tools/mfoc (GPL-2.0)
+- Protocol papers: *Dismantling MIFARE Classic* (Garcia et al., ESORICS 2008);
+  *Wirelessly Pickpocketing a Mifare Classic Card* (Courtois, Nohl, O'Neil 2008)
