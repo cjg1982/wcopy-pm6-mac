@@ -1,4 +1,6 @@
-# wCopy NFC for Mac
+# wCopy PM6 for Mac — macOS NFC Reader & Writer
+
+A native macOS application for the **wCopy PM6 / NFC-PM6 USB NFC reader**, with card backup, restore and verified UID writing on compatible cards. If you are searching for a **PM6 Mac driver**, this project provides a macOS application using the system IOKit HID interface, without an extra kernel driver.
 
 > **PM6 adaptation:** Based on [zhjcreator/wcopy-nfc-mac](https://github.com/zhjcreator/wcopy-nfc-mac), with local PM6 compatibility and automatic recovery changes assisted by OpenAI Codex. Existing application and recovery code are inherited, not wholly original. See [provenance and license-review limits](docs/PROVENANCE.md) and [third-party notices](THIRD_PARTY_NOTICES.md).
 
@@ -10,6 +12,20 @@ USB-HID and PN532 encapsulation protocol reverse-engineered by
 using IOKit directly on macOS — no kernel driver, `hidraw`, GTK, or Python runtime required.
 
 The app supports both **English and Chinese**, detecting the system language automatically.
+
+## Download for macOS
+
+[Download v1.4.0-pm6.1 (Apple Silicon, macOS 13+)](https://github.com/cjg1982/wcopy-pm6-mac/releases/tag/v1.4.0-pm6.1) · [All releases](https://github.com/cjg1982/wcopy-pm6-mac/releases)
+
+This is a community prerelease for Apple Silicon Macs (M1 and later). The application is ad-hoc signed, not Apple Developer ID signed or notarized. Intel builds are not included. Source and build instructions remain available below.
+
+### PM6 on Mac: application, not a Windows driver
+
+The Windows package referenced during development is distributed as a compiled Windows application; this project offers a native macOS alternative for the tested PM6 firmware. It is **not a claim to be the first Mac driver**: this adaptation builds on the existing macOS upstream credited above. It is not an official reader-vendor release.
+
+- **Does PM6 work on macOS?** The tested device is `0416:B029`, firmware `wCopy NSR122-H V701A2`. Other firmware needs validation.
+- **Do I need a PM6 Mac driver?** No separate kernel driver is required by this app; it uses macOS IOKit USB-HID.
+- **Does it support every PN532 reader?** No. It supports PN532 commands inside the supported wCopy HID wrapper; generic UART/I²C/SPI modules are not supported directly.
 
 ## Device Support
 

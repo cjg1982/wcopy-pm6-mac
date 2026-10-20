@@ -1,4 +1,6 @@
-# wCopy NFC for Mac
+# wCopy PM6 for Mac — PM6 读卡器 macOS 原生应用
+
+面向 **wCopy PM6 / NFC-PM6 USB NFC 读卡器**的 macOS 原生软件，提供读卡备份、恢复和兼容卡 UID 写入。如果你在寻找“**PM6 Mac 驱动**”“PM6 苹果电脑读卡软件”，本项目通过 macOS 系统 IOKit HID 接口通信，无需安装额外内核驱动。
 
 > **PM6 改进版说明：** 本版基于 [zhjcreator/wcopy-nfc-mac](https://github.com/zhjcreator/wcopy-nfc-mac)，使用 OpenAI Codex 辅助完成 PM6 兼容和自动补读等改动。原有应用和恢复引擎继承自上游，不宣称全部原创。详见[来源、改动及许可核查边界](docs/PROVENANCE.md)与[第三方声明](THIRD_PARTY_NOTICES.md)。
 
@@ -8,6 +10,20 @@
 [`mariogiordano96/wcopy-nfc-linux`](https://github.com/mariogiordano96/wcopy-nfc-linux)
 逆向得到的 USB-HID 与 PN532 封装协议重新实现，macOS 侧直接使用 IOKit，不需要内核驱动、
 `hidraw`、GTK 或 Python 运行时。
+
+## macOS 下载
+
+[下载 v1.4.0-pm6.1（Apple Silicon，macOS 13+）](https://github.com/cjg1982/wcopy-pm6-mac/releases/tag/v1.4.0-pm6.1) · [全部发布版本](https://github.com/cjg1982/wcopy-pm6-mac/releases)
+
+当前为社区预发布版，适用于 M1 及更新的 Apple Silicon Mac。应用采用本地临时签名，未使用 Apple Developer ID 签名或完成公证；暂不提供 Intel 安装包。源码及自行构建方法见下文。
+
+### 让主要配套 Windows 软件的 PM6 在 Mac 上使用
+
+开发时参考的 Windows 配套仓库提供的是 Windows 编译版程序。本项目为已测试固件的 PM6 提供原生 macOS 替代应用，**不宣称是“第一个 Mac 驱动”**：本改进版基于已存在的 macOS 上游，来源已在上方注明，也不是设备厂商官方发布。
+
+- **PM6 能在 Mac 上用吗？** 已测试 `0416:B029`、固件 `wCopy NSR122-H V701A2`，其他固件需要实测。
+- **需要装 PM6 Mac 驱动吗？** 本应用使用系统 IOKit USB-HID，无需额外内核驱动。
+- **兼容所有 PN532 吗？** 仅支持已适配的 wCopy HID 封装，不支持裸模块 UART/I²C/SPI 直连。
 
 ## 设备支持
 
