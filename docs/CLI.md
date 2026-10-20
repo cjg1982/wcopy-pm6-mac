@@ -4,7 +4,7 @@
 IOKit HID、wCopy 封装协议和 PN532/MIFARE Classic 实现，不需要 Python、GTK、`hidraw` 或
 第三方 HID 驱动。
 
-CLI 当前支持 `0416:B008` 和 `0416:B030`，要求 macOS 13 或更高版本。只有 `reader-info` 或其他
+CLI 当前识别 `0416:B008`、`0416:B030` 和实验性 PM6 `0416:B029`（NSR122-H V701A2 已通过握手，卡片读写待验证），要求 macOS 13 或更高版本。只有 `reader-info` 或其他
 硬件命令成功完成 HID 序列同步和初始化握手，才能说明设备协议已就绪；`devices` 只代表系统枚举
 到了兼容 HID 接口。
 
@@ -537,3 +537,25 @@ Agent 决策规则：
 只操作你拥有或得到明确授权的卡片。CLI 不实现 125 kHz ID 卡、UFUID 永久锁定或任意 PN532 写命令。
 恢复尾块、格式化和 UID 修改均可能破坏卡片。`--yes` 只表示调用方确认本次操作，不会降低物理风险，
 也不能替代备份、卡型确认和授权记录。
+
+### 单扇区词典检查
+
+`keys --sectors 6` 仅检查编号为 6 的扇区（块 24–27）；支持范围如 `0-3,6`，省略时检查整卡。输出的 `totalSlots` 和 `sectorKeys` 仅包括请求范围；卡片元数据仍保留完整几何。`capabilities` 的 keys 条目提供 `sectorFilter: true`。
+
+```bash
+./dist/wcopy-nfc keys --preset custom --dictionary /absolute/path/mfc_default_keys.dic --sectors 6 --pretty
+```
+
+Proxmark3 词典由用户在线载入或导入，不随本项目分发。词典检查不是 Nested 恢复；未命中不自动启动恢复。未知设备状态仍返回错误，不会伪装为正常候选不匹配。
+
+实测例外：仅 `0416:B029` 且固件为 `wCopy NSR122-H V701A2` 时，完整认证响应 `D5 41 FD 90 00` 表示密钥不匹配，认证失败后重新选卡。此前显示的 `0x3D` 是 `FD` 被 `0x3F` 掩码处理的结果。其他响应、固件和设备维持严格异常处理。
+
+### 通信异常重复检查
+
+`keys --sectors 6 --rounds 3` 最多执行三轮，默认 `--rounds 1`；仅对通信异常重试。轮间重新同步并初始化同一个 HID 会话，并核对原卡 UID。完整词典返回（即使没有命中）立即结束；取消、换卡、无卡及参数错误不会重试。轮次和原始异常写入 verbose stderr，连续异常耗尽后返回 TRANSPORT 错误，明确说明词典未完成。不会自动进入 Nested 恢复。`capabilities` 的 keys 条目提供 `maxRetryRounds: 3`。
+
+PM6 V701A2 的 `recover` 使用已完成 HID 初始化的模式，跳过无响应的重复 SAMConfig；其他设备仍发送 SAMConfig。已验证 nonce/距离采集通道，不保证恢复命中，只有卡片认证成功的候选才属于恢复结果。
+
+PM6 libnfc bridge 对已验证的 NSR122-H V701A2 固件，将完整响应 D5 41 FD 90 00 仅在对应的 15 字节 MIFARE Key A/Key B 认证请求中转换为标准认证拒绝码 14。响应转换发生在桥接边界，不修改卡片；其他命令及未知响应不转换。已验证 nfc-list 寻卡与 mfoc Nested 采集流程，恢复结果仍以实际认证为准。
+
+GUI and CLI version output share `AppVersion.current`; the local PM6 adaptation reports `1.4.0-pm6.1`. This version change does not change schemaVersion.
