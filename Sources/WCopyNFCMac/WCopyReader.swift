@@ -50,10 +50,20 @@ struct RestoreOptions {
     var targetSectorKeys: [Int: SectorKeyResult]?
 }
 
+struct DumpVerificationResult {
+    let checked: Int
+    let matched: Int
+    let mismatchedBlocks: [Int]
+    let unreadableBlocks: [Int]
+    let failedKeySectors: [Int]
+    var passed: Bool { checked > 0 && matched == checked && failedKeySectors.isEmpty }
+}
+
 struct RestoreResult {
     let written: Int
     let failed: [Int]
     let skipped: Int
+    var verification: DumpVerificationResult? = nil
 }
 
 final class WCopyReader {
@@ -546,6 +556,7 @@ final class WCopyReader {
         var acknowledgedBlocks: [Int] = []
         var sectorsWithDataFailure = Set<Int>()
 
+        var verification: DumpVerificationResult?
         do {
             let normalSectors = Dictionary(grouping: normalBlocks, by: { CardLayout.sector(containing: $0.0) })
             for sector in normalSectors.keys.sorted() {
@@ -666,7 +677,9 @@ final class WCopyReader {
                         ? true
                         : try authenticate(block: first, uid: target.uid, key: keyB, type: .b)
                     let accessMatches: Bool
-                    if keyAWorks, let readback = try readBlock(block) {
+                    try NestedRecoverySession(transport: self, target: target, logger: logger).configureForAuth()
+                    if keyAWorks, try authenticate(block: first, uid: target.uid, key: keyA, type: .a),
+                       let readback = try readBlock(block) {
                         accessMatches = readback.subdata(in: 6..<10) == data.subdata(in: 6..<10)
                             && (!keyBReadable || readback.suffix(6) == data.suffix(6))
                     } else {
@@ -680,6 +693,14 @@ final class WCopyReader {
                 if ok { written += 1 } else { failed.append(block) }
                 completed += 1
             }
+            if options.verify {
+                verification = try verifyDump(dump: validatedDump, options: options,
+                    scanMode: scanMode, expectedUID: target.uid, progress: progress, token: token)
+                if let report = verification {
+                    failed.append(contentsOf: report.mismatchedBlocks + report.unreadableBlocks)
+                    failed.append(contentsOf: report.failedKeySectors.map { CardLayout.trailerBlock(of: $0) })
+                }
+            }
         } catch {
             guard !attemptedBlocks.isEmpty else { throw error }
             throw MutationError(
@@ -689,8 +710,114 @@ final class WCopyReader {
                 reason: error.localizedDescription
             )
         }
+        if written > 0 && failed.isEmpty && (!options.verify || verification?.passed == true) {
+            do { try soundPM6Completion() }
+            catch { logger("写入已完成，但 PM6 机身提示音指令失败：\(error.localizedDescription)") }
+        }
         progress?(1, "恢复完成")
-        return RestoreResult(written: written, failed: failed.sorted(), skipped: max(0, skipped))
+        return RestoreResult(written: written, failed: Array(Set(failed)).sorted(), skipped: max(0, skipped), verification: verification)
+    }
+
+    /// Reader-local buzzer command observed in the Windows PM6 implementation.
+    /// This does not issue an NFC command or modify the card.
+    func soundPM6Completion() throws {
+        guard pm6AuthenticationCompatibility else { return }
+        let response = try send(Data([0xFF, 0x00, 0x40, 0x50, 0x04, 0x05, 0x01, 0x01, 0x01]), timeout: 2)
+        guard response == Data([0x90, 0x00]) else {
+            throw AppError.operation("PM6 蜂鸣器应答异常：\(HexCodec.string(response))")
+        }
+        logger("PM6 机身蜂鸣器提示指令已应答")
+    }
+
+    /// Compare readable trailer bytes only; hidden keys require authentication checks.
+    static func verificationBytesMatch(block: Int, expected: Data, actual: Data) -> Bool {
+        guard expected.count == 16, actual.count == 16 else { return false }
+        if !CardLayout.isTrailer(block) { return expected == actual }
+        guard actual.subdata(in: 6..<10) == expected.subdata(in: 6..<10) else { return false }
+        return CardLayout.keyBIsReadableData(in: expected) == true
+            ? actual.suffix(6) == expected.suffix(6) : true
+    }
+
+    /// Read-only comparison, with RF reset and fresh authentication for each block.
+    func verifyDump(dump: DumpDocument, options: RestoreOptions,
+                    scanMode: CardScanMode = .automatic, expectedUID: Data? = nil,
+                    progress: ((Double, String) -> Void)? = nil,
+                    token: CancellationToken? = nil) throws -> DumpVerificationResult {
+        try token?.check()
+        let dump = try dump.validated()
+        guard let detected = try selectTarget() else { throw AppError.noCard }
+        let target = target(detected, applying: scanMode)
+        if let expectedUID, target.uid != expectedUID {
+            throw AppError.operation("校验时卡片发生变化，已停止")
+        }
+        guard dump.inferredKind.blockCount <= target.kind.blockCount else {
+            throw AppError.invalidDump("源备份超过当前卡片容量，无法校验")
+        }
+        var selected = dump.sortedBlocks.filter { block, _ in
+            (!options.skipSectorZero || CardLayout.sector(containing: block) != 0)
+                && (block != 0 || options.includeBlock0)
+                && (!CardLayout.isTrailer(block) || options.includeTrailers)
+        }
+        guard !selected.isEmpty else { throw AppError.operation("没有可校验的数据块") }
+        for index in selected.indices where CardLayout.isTrailer(selected[index].0) {
+            let sector = CardLayout.sector(containing: selected[index].0)
+            guard let keys = dump.sectorKeys?[String(sector)], let a = keys.a, let b = keys.b else {
+                throw AppError.invalidDump("校验密钥区需要扇区 \(sector) 的完整 A/B 密钥")
+            }
+            selected[index].1.replaceSubrange(0..<6, with: try validatedKey(a))
+            selected[index].1.replaceSubrange(10..<16, with: try validatedKey(b))
+            guard CardLayout.keyBIsReadableData(in: selected[index].1) != nil else {
+                throw AppError.invalidDump("扇区 \(sector) 的访问位校验失败")
+            }
+        }
+        let session = NestedRecoverySession(transport: self, target: target, logger: logger)
+        defer { try? session.restoreNormal() }
+        var matched = 0
+        var mismatches: [Int] = [], unreadable: [Int] = [], failedKeys: [Int] = []
+        for (index, item) in selected.enumerated() {
+            try token?.check()
+            let (block, expected) = item
+            let sector = CardLayout.sector(containing: block)
+            progress?(Double(index) / Double(selected.count), "重新认证并校验块 \(block)")
+            var credentials: [(Data, KeyType)] = []
+            if options.includeTrailers {
+                guard let keys = dump.sectorKeys?[String(sector)], let a = keys.a, let b = keys.b,
+                      let trailerHex = dump.blocks[String(CardLayout.trailerBlock(of: sector))] else {
+                    throw AppError.invalidDump("缺少扇区 \(sector) 的校验密钥")
+                }
+                credentials.append((try validatedKey(a), .a))
+                if CardLayout.keyBIsReadableData(in: try HexCodec.data(from: trailerHex, expectedBytes: 16)) != true {
+                    credentials.append((try validatedKey(b), .b))
+                }
+            } else {
+                let auth = try authentication(for: sector, dump: dump, options: options)
+                credentials.append((auth.key, auth.type))
+            }
+            if CardLayout.isTrailer(block) {
+                for (key, type) in credentials {
+                    try token?.check()
+                    try session.configureForAuth()
+                    if try !authenticate(block: block, uid: target.uid, key: key, type: type) {
+                        failedKeys.append(sector)
+                    }
+                }
+            }
+            var readback: Data?
+            for (key, type) in credentials {
+                try token?.check()
+                try session.configureForAuth()
+                if try authenticate(block: block, uid: target.uid, key: key, type: type),
+                   let data = try readBlock(block) { readback = data; break }
+            }
+            guard let readback else { unreadable.append(block); logger("校验块 \(block)：无法读取"); continue }
+            if Self.verificationBytesMatch(block: block, expected: expected, actual: readback) {
+                matched += 1
+            } else { mismatches.append(block); logger("校验块 \(block)：与源文件不同") }
+        }
+        progress?(1, "校验结束：一致 \(matched)/\(selected.count)，差异 \(mismatches.count)，无法读取 \(unreadable.count)")
+        return DumpVerificationResult(checked: selected.count, matched: matched,
+            mismatchedBlocks: mismatches, unreadableBlocks: unreadable,
+            failedKeySectors: Array(Set(failedKeys)).sorted())
     }
 
     func writeUID(newUID: Data, keyHex: String, token: CancellationToken? = nil) throws -> Bool {
@@ -997,7 +1124,7 @@ final class WCopyReader {
 
     func readBlock(_ block: Int) throws -> Data? {
         let response = try pn532(Data([0xD4, 0x40, 0x01, 0x30, UInt8(block)]))
-        guard response.count >= 19, response[0] == 0xD5, response[2] == 0 else { return nil }
+        guard response.count >= 19, response[0] == 0xD5, response[1] == 0x41, response[2] == 0 else { return nil }
         return response.subdata(in: 3..<19)
     }
 
@@ -1006,7 +1133,7 @@ final class WCopyReader {
         var command = Data([0xD4, 0x40, 0x01, 0xA0, UInt8(block)])
         command.append(data)
         let response = try pn532(command)
-        return response.count >= 3 && response[0] == 0xD5 && response[2] == 0
+        return response.count >= 3 && response[0] == 0xD5 && response[1] == 0x41 && response[2] == 0
     }
 
     private func validatedKey(_ keyHex: String) throws -> Data {
