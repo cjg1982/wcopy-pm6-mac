@@ -72,7 +72,7 @@ cat > "$STAGED_BUNDLE/Contents/Info.plist" <<'PLIST'
     <key>CFBundleShortVersionString</key>
     <string>1.4.0</string>
     <key>CFBundleVersion</key>
-    <string>3</string>
+    <string>4</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>NSHumanReadableCopyright</key>
