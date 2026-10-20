@@ -33,6 +33,8 @@ cp "$MACOS/WCopyNFCMac" "$STAGED_CLI"
 
 cp "$ROOT/LICENSE" "$RESOURCES/LICENSE"
 cp "$ROOT/THIRD_PARTY_NOTICES.md" "$RESOURCES/THIRD_PARTY_NOTICES.md"
+mkdir -p "$RESOURCES/docs"
+cp "$ROOT/docs/PROVENANCE.md" "$RESOURCES/docs/PROVENANCE.md"
 
 ICONSET="$STAGING/AppIcon.iconset"
 rm -rf "$ICONSET"
@@ -68,9 +70,9 @@ cat > "$STAGED_BUNDLE/Contents/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.3.0</string>
+    <string>1.4.0</string>
     <key>CFBundleVersion</key>
-    <string>2</string>
+    <string>3</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>NSHumanReadableCopyright</key>
