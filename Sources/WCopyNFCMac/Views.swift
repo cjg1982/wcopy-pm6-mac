@@ -144,7 +144,7 @@ private struct Sidebar: View {
                 Text("13.56 MHz MIFARE Classic")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
-                    Text("v1.3.0")
+                    Text("v\(AppVersion.current)")
                         .font(.caption2.monospaced())
                         .foregroundStyle(.tertiary)
             }
@@ -311,7 +311,7 @@ private struct OverviewView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
             PageHeader(
-                eyebrow: "NSR106-IDIC V",
+                eyebrow: "WCOPY NFC · macOS",
                 title: greeting,
                 subtitle: "面向 wCopy USB 读卡器的原生 macOS 工作台。设备识别、协议握手和卡片状态分别验证，不会用“已发现 USB”冒充“可以读卡”。"
             )
@@ -394,6 +394,8 @@ private struct ReadCardView: View {
     @State private var readAll = true
     @State private var sectors = "0-15"
     @State private var scanMode: CardScanMode = .automatic
+    @State private var autoRecover = true
+    @State private var recoveryRounds = 3
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -414,16 +416,26 @@ private struct ReadCardView: View {
                         Toggle("根据卡片类型读取全部扇区", isOn: $readAll)
                         TextField("扇区，例如 0-15", text: $sectors)
                             .disabled(readAll)
+                        Toggle("自动恢复未读扇区（只读）", isOn: $autoRecover)
+                            .disabled(model.busy)
+                        if autoRecover {
+                            Stepper("最多 \(recoveryRounds) 轮", value: $recoveryRounds, in: 1...10)
+                                .disabled(model.busy)
+                            Text("只重试未读扇区，改变认证序列并校验样本；成功即补读。可取消，已读数据保留，不保证所有卡均能恢复。")
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
                         Button {
                             model.readAndDetect(
                                 key: key,
                                 keyType: keyType,
                                 readAll: readAll,
                                 sectors: sectors,
-                                scanMode: scanMode
+                                scanMode: scanMode,
+                                autoRecover: autoRecover,
+                                recoveryRounds: recoveryRounds
                             )
                         } label: {
-                            Label("自动检测并读取", systemImage: "wave.3.right.circle.fill")
+                            Label(autoRecover ? "读取并自动补全" : "自动检测并读取", systemImage: "wave.3.right.circle.fill")
                                 .frame(maxWidth: .infinity)
                         }
                         .buttonStyle(.borderedProminent)
@@ -570,15 +582,14 @@ private struct RestoreView: View {
     @EnvironmentObject private var model: AppModel
     @State private var keyOverride = ""
     @State private var keyType: KeyType = .a
-    @State private var block0 = false
-    @State private var trailers = false
+    @State private var copyMode: CardCopyMode = .normal
     @State private var verify = true
     @State private var confirming = false
     @State private var scanMode: CardScanMode = .automatic
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
-            PageHeader(eyebrow: "RESTORE", title: "恢复转储", subtitle: "导入上游兼容 JSON 或标准 MFD。默认只恢复普通数据块，制造块和扇区尾块保持不变。")
+            PageHeader(eyebrow: "RESTORE", title: "恢复转储", subtitle: "导入 JSON 或 MFD，选择普通复制或完整复制，再检测目标卡密钥。")
             HStack(alignment: .top, spacing: 16) {
                 VStack(spacing: 16) {
                     Surface {
@@ -653,19 +664,30 @@ private struct RestoreView: View {
                             Text(warning).font(.caption).foregroundStyle(brandOrange)
                         }
                         Divider()
-                        HStack {
-                            Toggle("写后回读验证", isOn: $verify)
-                                        InfoButton(text: "写入后立即回读并比对，确保数据正确写入。建议保持开启。")
+                        Picker("复制模式", selection: $copyMode) {
+                            ForEach(CardCopyMode.allCases) { mode in
+                                Text(mode.rawValue).tag(mode)
+                            }
                         }
-                        HStack {
-                            Toggle("包含块 0 / UID（仅 Magic 卡）", isOn: $block0).tint(brandOrange)
-                                        InfoButton(text: "写入制造块。仅 CUID/Magic 卡支持，普通原装卡写入会失败。")
+                        .disabled(model.busy)
+                        Text(copyMode.explanation)
+                            .font(.caption)
+                            .foregroundStyle(copyMode == .complete ? brandOrange : .secondary)
+                        Toggle("写后回读验证", isOn: Binding(
+                            get: { copyMode == .complete || verify },
+                            set: { verify = $0 }
+                        ))
+                            .disabled(copyMode == .complete || model.busy)
+                        if copyMode == .complete {
+                            Text("完整复制强制验证。请先保存目标卡备份；不能保证复制后能开门。")
+                                .font(.caption).foregroundStyle(brandOrange)
                         }
-                        HStack {
-                            Toggle("包含扇区尾块（可能锁卡）", isOn: $trailers).tint(.red)
-                                        InfoButton(text: "改写每个扇区的密钥和访问位。错误访问位可能永久锁定扇区。操作前务必已有完整备份。")
+                        Button("开始复制") {
+                            do {
+                                if let dump = model.importedDump { try copyMode.validate(dump) }
+                                confirming = true
+                            } catch { model.errorMessage = error.localizedDescription }
                         }
-                        Button("开始恢复") { confirming = true }
                             .buttonStyle(.borderedProminent).tint(brandTeal)
                             .disabled(!model.canOperate || model.importedDump == nil)
                     }
@@ -673,21 +695,21 @@ private struct RestoreView: View {
                 }
             }
             Surface {
-                Label("安全默认值", systemImage: "shield.lefthalf.filled")
+                Label("复制范围", systemImage: "shield.lefthalf.filled")
                     .font(.headline).foregroundStyle(brandTeal)
-                Text("普通恢复永远跳过块 0 和每个扇区的尾块。勾选危险选项前，请确认你拥有目标卡片、已有备份，并理解错误访问位可能永久锁定扇区。")
+                Text("普通复制保留 UID 和密钥区。完整复制包含块 0 和所有扇区尾块，会改变目标卡密钥及访问权限，须使用完整备份和兼容的可改 UID 卡。")
                     .foregroundStyle(.secondary).padding(.top, 5)
             }
         }
         .confirmationDialog("确认写入卡片？", isPresented: $confirming, titleVisibility: .visible) {
-            Button("确认恢复", role: .destructive) {
+            Button(copyMode == .complete ? "确认完整复制（含 UID 和密钥）" : "确认普通复制", role: .destructive) {
                 model.restoreDump(
                     options: RestoreOptions(
                         keyOverride: keyOverride.isEmpty ? nil : keyOverride,
                         keyTypeOverride: keyOverride.isEmpty ? nil : keyType,
-                        includeBlock0: block0,
-                        includeTrailers: trailers,
-                        verify: verify,
+                        includeBlock0: copyMode.includesProtectedBlocks,
+                        includeTrailers: copyMode.includesProtectedBlocks,
+                        verify: copyMode == .complete || verify,
                         targetSectorKeys: model.keyResults
                     ),
                     scanMode: scanMode
@@ -695,7 +717,7 @@ private struct RestoreView: View {
             }
             Button("取消", role: .cancel) {}
         } message: {
-            Text(block0 || trailers ? "已启用危险块写入；应用会先验证全部目标扇区及完整尾块密钥。" : "默认只写普通数据块，制造块和密钥区不会改变。")
+            Text(copyMode.explanation)
         }
     }
 
@@ -773,10 +795,15 @@ private struct FormatView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
             PageHeader(eyebrow: "DESTRUCTIVE", title: "格式化卡片", subtitle: "清零数据块，并将尾块恢复为 FFFFFFFFFFFF / FF0780 / GPB / FFFFFFFFFFFF。块 0 永不改动。")
-            SectorKeyPanel(key: $key, keyType: $keyType)
             Surface {
                 HStack(alignment: .top, spacing: 30) {
                     Form {
+                        SecureField("当前卡片密钥", text: $key)
+                            .disabled(model.busy)
+                        Picker("密钥类型", selection: $keyType) {
+                            ForEach(KeyType.allCases) { Text("Key \($0.rawValue)").tag($0) }
+                        }
+                        .disabled(model.busy)
                         TextField("扇区", text: $sectors)
                         TextField("GPB（1 字节）", text: $gpb)
                         Picker("卡型模式", selection: $scanMode) {
@@ -880,6 +907,7 @@ private struct SectorKeyPanel: View {
     @State private var customKeys = ""
     @State private var importedFileName = ""
     @State private var downloading = false
+    @State private var onlySectorSix = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -928,13 +956,23 @@ private struct SectorKeyPanel: View {
                 .frame(height: 60)
                 .padding(4)
                 .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 6))
+            Toggle("仅检查第 6 扇区（块 24–27）", isOn: $onlySectorSix)
+                .font(.caption).disabled(model.busy || downloading)
+            Text("词典检查仅尝试候选密钥；未知设备错误会停止，不会自动启动密钥恢复。")
+                .font(.caption2).foregroundStyle(.secondary)
             HStack(spacing: 6) {
                 Button("检测") {
-                    model.checkKeys(preset: preset, customKeys: MifareKeyDictionary.parse(customKeys).keys, scanMode: .automatic)
+                    model.checkKeys(preset: preset, customKeys: MifareKeyDictionary.parse(customKeys).keys, sectors: onlySectorSix ? [6] : nil, scanMode: .automatic)
                 }
                 .buttonStyle(.borderedProminent).tint(brandTeal)
                 .disabled(!model.canOperate)
                 .help("按命中概率逐扇区检测 Key A 和 Key B。SAK 19 兼容卡自动加入 UID 派生密钥候选。")
+                Button("Proxmark3 检查扇区 6") {
+                    onlySectorSix = true
+                    downloadDictionary(.proxmark3, checkSectorSix: true)
+                }
+                .disabled(!model.canOperate || downloading)
+                .help("在线载入 Proxmark3 GPLv3+ 默认密钥词典，仅验证第 6 扇区 Key A/Key B，不写卡。")
                 Button("导入 JSON") {
                     let panel = NSOpenPanel()
                     panel.allowedContentTypes = [.json]
@@ -947,6 +985,15 @@ private struct SectorKeyPanel: View {
                     Button("清除结果") { model.keyResults = [:]; model.detectedSectorKeys = nil }
                         .font(.caption).foregroundStyle(.secondary)
                 }
+            }
+            HStack {
+                Button("扇区 6 重复检查（最多 3 轮）") {
+                    onlySectorSix = true
+                    downloadDictionary(.proxmark3, checkSectorSix: true, rounds: 3)
+                }
+                .disabled(!model.canOperate || downloading)
+                Text("异常后重新初始化；完整检查完成即停止。可用顶部取消按钮中止。")
+                    .font(.caption2).foregroundStyle(.secondary)
             }
             if model.keyResults.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
@@ -1004,7 +1051,7 @@ private struct SectorKeyPanel: View {
         }
     }
 
-    private func downloadDictionary(_ source: OnlineKeyDictionarySource) {
+    private func downloadDictionary(_ source: OnlineKeyDictionarySource, checkSectorSix: Bool = false, rounds: Int = 1) {
         downloading = true
         model.downloadDictionary(source) { result in
             downloading = false
@@ -1012,6 +1059,9 @@ private struct SectorKeyPanel: View {
             case .success(let dictionary):
                 customKeys = dictionary.text
                 importedFileName = "\(source.rawValue)（在线）"
+                if checkSectorSix {
+                    model.checkKeys(preset: .customOnly, customKeys: dictionary.parsed.keys, sectors: [6], rounds: rounds, scanMode: .automatic)
+                }
             case .failure(let error):
                 model.errorMessage = "下载失败：\(error.localizedDescription)"
             }

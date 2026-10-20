@@ -6,6 +6,40 @@ struct HandshakeInfo {
     let sequence: UInt16
 }
 
+enum CardCopyMode: String, CaseIterable, Identifiable {
+    case normal = "普通复制（不复制 UID）"
+    case complete = "完整复制（含 UID）"
+    var id: String { rawValue }
+    var includesProtectedBlocks: Bool { self == .complete }
+    var explanation: String {
+        self == .complete
+            ? "复制 UID、制造块、普通数据、全部密钥和访问权限。仅适用于支持改 UID 的兼容卡；源卡限制也会被复制，可能锁住扇区。"
+            : "只复制普通数据块，保留目标卡 UID、密钥和访问权限。"
+    }
+    func validate(_ dump: DumpDocument) throws {
+        let checked = try dump.validated()
+        guard self == .complete else { return }
+        let kind = checked.inferredKind
+        guard (0..<kind.blockCount).allSatisfy({ checked.blocks[String($0)] != nil }) else {
+            throw AppError.invalidDump("完整复制需要全部数据块，请导入完整备份")
+        }
+        let uid = try HexCodec.data(from: checked.uid, expectedBytes: 4)
+        let manufacturer = try HexCodec.data(from: checked.blocks["0"]!, expectedBytes: 16)
+        guard CardLayout.manufacturerBlock(manufacturer, matchesUID: uid) else {
+            throw AppError.invalidDump("完整复制要求块 0 与四字节 UID、BCC 一致")
+        }
+        for sector in 0..<kind.sectorCount {
+            guard let keys = checked.sectorKeys?[String(sector)], keys.a != nil, keys.b != nil else {
+                throw AppError.invalidDump("完整复制缺少扇区 \(sector) 的 Key A 或 Key B")
+            }
+            let trailer = try HexCodec.data(from: checked.blocks[String(CardLayout.trailerBlock(of: sector))]!, expectedBytes: 16)
+            guard CardLayout.keyBIsReadableData(in: trailer) != nil else {
+                throw AppError.invalidDump("扇区 \(sector) 访问位校验失败，不能完整复制")
+            }
+        }
+    }
+}
+
 struct RestoreOptions {
     var keyOverride: String?
     var keyTypeOverride: KeyType?
@@ -28,10 +62,15 @@ final class WCopyReader {
 
     private let transport: HIDTransportProtocol
     private let logger: (String) -> Void
+    private let usesCommandResponseHeader: Bool
+    private var pm6AuthenticationCompatibility = false
+    var requiresSAMConfiguration: Bool { !pm6AuthenticationCompatibility }
+    var usesPM6AuthenticationCompatibility: Bool { pm6AuthenticationCompatibility }
     private(set) var sequence: UInt16?
 
-    init(transport: HIDTransportProtocol, logger: @escaping (String) -> Void = { _ in }) {
+    init(transport: HIDTransportProtocol, productID: Int? = nil, logger: @escaping (String) -> Void = { _ in }) {
         self.transport = transport
+        self.usesCommandResponseHeader = productID == 0xB029
         self.logger = logger
     }
 
@@ -70,13 +109,16 @@ final class WCopyReader {
         return report.subdata(in: 4..<payloadEnd)
     }
 
-    static func mifareAuthenticationSucceeded(_ response: Data) throws -> Bool {
+    static func mifareAuthenticationSucceeded(_ response: Data, pm6Compatibility: Bool = false) throws -> Bool {
         guard response.count >= 3, response[0] == 0xD5, response[1] == 0x41 else {
             throw AppError.transport("PN532 返回了无效的 MIFARE 认证响应")
         }
         let status = response[2] & 0x3F
         if status == 0 { return true }
         if status == 0x14 { return false }
+        // NSR122-H V701A2 wraps an authentication rejection as FD + APDU 9000.
+        // A known-good / wrong-key / known-good control verified this exact response.
+        if pm6Compatibility, response == Data([0xD5, 0x41, 0xFD, 0x90, 0x00]) { return false }
         throw AppError.transport("MIFARE 认证出现 PN532 错误 0x\(String(format: "%02X", status))，未将其计为密钥错误")
     }
 
@@ -90,6 +132,9 @@ final class WCopyReader {
         sequence = nil
         transport.drain()
         let probe = Data([0xFF, 0x00, 0x68])
+        // PM6 responds with command + 1 in the header, independent of the host counter.
+        let center: UInt16 = usesCommandResponseHeader ? 0 : center
+        let radius = usesCommandResponseHeader ? 0 : radius
         var candidates: [UInt16] = [center]
         if radius > 0 {
             for delta in 1...radius {
@@ -100,7 +145,7 @@ final class WCopyReader {
         logger("正在同步 HID 序列计数器…")
         for (index, candidate) in candidates.enumerated() {
             try token?.check()
-            if let _ = try exchange(candidate, content: probe, timeout: timeout) {
+            if let _ = try exchange(candidate, content: probe, timeout: usesCommandResponseHeader ? max(timeout, 1) : timeout) {
                 sequence = candidate &+ 2
                 logger("同步成功，序列号 0x\(String(format: "%04X", sequence!))")
                 progress?(1)
@@ -108,10 +153,11 @@ final class WCopyReader {
             }
             progress?(Double(index + 1) / Double(candidates.count))
         }
-        throw AppError.operation("设备已打开，但协议同步失败。请拔插读卡器后重试；0416:B008 可能使用了不同固件协议。")
+        throw AppError.operation("设备已打开，但协议同步失败。请拔插读卡器后重试；当前设备可能使用了不同固件协议。")
     }
 
     func initialize() throws -> HandshakeInfo {
+        pm6AuthenticationCompatibility = false
         let firmwareData = try send(Data([0xFF, 0x00, 0x68]))
         let serialData = try send(Data([0xFF, 0x00, 0x69]))
         _ = try send(Data([0xFF, 0x00, 0x62, 0x01, 0x06, 0x00, 0x00, 0x1F, 0x01, 0xFA, 0x00]))
@@ -121,6 +167,8 @@ final class WCopyReader {
             serial: readablePayload(serialData),
             sequence: sequence ?? 0
         )
+        pm6AuthenticationCompatibility = usesCommandResponseHeader && info.firmware == "wCopy NSR122-H V701A2"
+        if pm6AuthenticationCompatibility { logger("已启用实测 PM6 V701A2 认证拒绝响应 FD/9000 兼容规则") }
         logger("设备初始化完成")
         return info
     }
@@ -180,17 +228,75 @@ final class WCopyReader {
         return ReadResult(target: target, blocks: blocks, failedSectors: failed, failedBlocks: failedBlocks)
     }
 
+    static func keyCheckSectors(_ requested: [Int]?, sectorCount: Int) throws -> [Int] {
+        let sectors = requested.map { Array(Set($0)).sorted() } ?? Array(0..<sectorCount)
+        guard !sectors.isEmpty, sectors.allSatisfy({ $0 >= 0 && $0 < sectorCount }) else {
+            throw AppError.invalidSectors(sectors.map(String.init).joined(separator: ","))
+        }
+        return sectors
+    }
+
+    static func retryKeyCheck<T>(rounds: Int, token: CancellationToken?,
+                                attempt: (Int) throws -> T,
+                                onFailure: (Int, Error) -> Void) throws -> T {
+        guard (1...3).contains(rounds) else { throw AppError.operation("检查轮数必须为 1–3") }
+        for round in 1...rounds {
+            try token?.check()
+            do { return try attempt(round) }
+            catch {
+                try token?.check()
+                guard case AppError.transport = error else { throw error }
+                onFailure(round, error)
+                if round == rounds {
+                    throw AppError.transport("重复检查已停止：\(rounds) 轮均遇到通信/认证异常，词典未完整检查，不能判定密钥不存在。最后错误：\(error.localizedDescription)")
+                }
+            }
+        }
+        throw AppError.operation("重复检查没有产生结果")
+    }
+
+    func checkKeysWithRetries(
+        candidates: [String], sectors: [Int]? = nil, rounds: Int = 1,
+        scanMode: CardScanMode = .automatic,
+        progress: ((Double, String) -> Void)? = nil,
+        token: CancellationToken? = nil
+    ) throws -> KeyCheckOutcome {
+        guard !candidates.isEmpty else { throw AppError.invalidKey }
+        guard let original = try selectTarget() else { throw AppError.noCard }
+        return try Self.retryKeyCheck(rounds: rounds, token: token, attempt: { round in
+            logger("重复检查：第 \(round)/\(rounds) 轮")
+            if round > 1 {
+                // Reinitialize the existing serialized HID session, without parallel access.
+                try sync(token: token)
+                _ = try initialize()
+            }
+            try token?.check()
+            return try checkKeys(candidates: candidates, sectors: sectors, expectedUID: original.uid,
+                                 scanMode: scanMode, progress: { value, text in
+                progress?((Double(round - 1) + value) / Double(rounds), "第 \(round)/\(rounds) 轮 · \(text)")
+            }, token: token)
+        }, onFailure: { round, error in
+            logger("第 \(round)/\(rounds) 轮未完成：\(error.localizedDescription)")
+        })
+    }
+
     func checkKeys(
         candidates: [String],
+        sectors requestedSectors: [Int]? = nil,
+        expectedUID: Data? = nil,
         scanMode: CardScanMode = .automatic,
         progress: ((Double, String) -> Void)? = nil,
         token: CancellationToken? = nil
     ) throws -> KeyCheckOutcome {
         guard let detectedTarget = try selectTarget() else { throw AppError.noCard }
+        if let expectedUID, detectedTarget.uid != expectedUID {
+            throw AppError.operation("重复检查期间卡片发生变化，已停止")
+        }
         let target = target(detectedTarget, applying: scanMode)
         guard target.kind != .unknown else {
             throw AppError.unsupported("检测到 \(target.kind.rawValue)，默认密钥检查仅支持 MIFARE Classic Mini / 1K / 4K")
         }
+        let sectors = try Self.keyCheckSectors(requestedSectors, sectorCount: target.kind.sectorCount)
         var keyCandidates = candidates
         if target.kind == .customClassic1K,
            let derived = SAK19Compatibility.uidDerivedKeyCandidate(target.uid) {
@@ -201,13 +307,13 @@ final class WCopyReader {
         guard !keys.isEmpty else {
             throw AppError.invalidKey
         }
-        var results = Dictionary(uniqueKeysWithValues: (0..<target.kind.sectorCount).map {
+        var results = Dictionary(uniqueKeysWithValues: sectors.map {
             ($0, SectorKeyResult(sector: $0))
         })
         var blocks: [Int: Data] = [:]
         var failedBlocks: [Int] = []
         var attempts = 0
-        let slotCount = target.kind.sectorCount * 2
+        let slotCount = sectors.count * 2
         let progressStride = max(1, keys.count / 100)
         var previousFoundSlots = 0
 
@@ -215,7 +321,7 @@ final class WCopyReader {
         // deeper into the dictionary, so common defaults are found quickly.
         for (keyIndex, (key, keyHex)) in keys.enumerated() {
             try token?.check()
-            for sector in 0..<target.kind.sectorCount {
+            for sector in sectors {
                 try token?.check()
                 let first = CardLayout.firstBlock(of: sector)
                 if results[sector]?.keyA == nil {
@@ -262,7 +368,7 @@ final class WCopyReader {
         // bits describe that field as readable data. Prefer the observed auth
         // result, and only classify the field as DATA after all candidates fail.
         if target.kind == .customClassic1K {
-            for sector in 0..<target.kind.sectorCount where results[sector]?.keyB == nil {
+            for sector in sectors where results[sector]?.keyB == nil {
                 try token?.check()
                 guard let keyAHex = results[sector]?.keyA else { continue }
                 let first = CardLayout.firstBlock(of: sector)
@@ -284,7 +390,7 @@ final class WCopyReader {
             }
         }
 
-        for sector in 0..<target.kind.sectorCount {
+        for sector in sectors {
             try token?.check()
             let result = results[sector]!
             let first = CardLayout.firstBlock(of: sector)
@@ -769,13 +875,24 @@ final class WCopyReader {
         }
     }
 
+    static func parseResponse(_ report: Data, sequence: UInt16, content: Data, commandHeader: Bool) -> Data? {
+        if commandHeader {
+            // PM6 byte 2 identifies the response command. Byte 3 varies independently
+            // of the request counter; retain frame length, checksum and footer checks.
+            guard content.count >= 3, report.count >= 6,
+                  report[2] == content[2] &+ 1 else { return nil }
+            return parseInputFrame(report)
+        }
+        return parseInputFrame(report, expectedSequence: sequence &+ 1)
+    }
+
     private func exchange(_ outboundSequence: UInt16, content: Data, timeout: TimeInterval) throws -> Data? {
         let frame = try Self.buildFrame(sequence: outboundSequence, content: content)
         try transport.write(frame)
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             guard let report = try transport.read(timeout: max(0, deadline.timeIntervalSinceNow)) else { return nil }
-            if let content = Self.parseInputFrame(report, expectedSequence: outboundSequence &+ 1) {
+            if let content = Self.parseResponse(report, sequence: outboundSequence, content: content, commandHeader: usesCommandResponseHeader) {
                 return content
             }
         }
@@ -805,7 +922,7 @@ final class WCopyReader {
         guard uid.count >= 4 else { return false }
         command.append(uid.suffix(4))
         let response = try pn532(command)
-        return try Self.mifareAuthenticationSucceeded(response)
+        return try Self.mifareAuthenticationSucceeded(response, pm6Compatibility: pm6AuthenticationCompatibility)
     }
 
     private func testAuthentication(block: Int, target: CardTarget, key: Data, type: KeyType) throws -> Bool {

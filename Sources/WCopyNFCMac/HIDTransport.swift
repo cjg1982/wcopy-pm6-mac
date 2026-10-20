@@ -2,7 +2,7 @@ import Foundation
 import IOKit.hid
 
 let wcopyVendorID = 0x0416
-let supportedProductIDs = [0xB008, 0xB030]
+let supportedProductIDs = [0xB008, 0xB029, 0xB030]
 
 struct HIDDeviceDescriptor: Identifiable {
     let id: UInt64

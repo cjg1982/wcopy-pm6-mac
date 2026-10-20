@@ -86,12 +86,17 @@ enum MifareBitFraming {
 /// Minimal transport surface used by the nested-attack session. `WCopyReader`
 /// conforms; a simulator can drive the algorithm in unit tests.
 protocol NestedRecoveryTransport {
+    var requiresSAMConfiguration: Bool { get }
     func rawPN532(_ bytes: Data) throws -> Data
     func readRegister(_ address: UInt16) throws -> UInt8
     func writeRegister(_ address: UInt16, value: UInt8) throws
     func transceiveRawBits(data: Data, parity: [UInt8], timeout: TimeInterval) throws -> (data: Data, parity: [UInt8])
     func authenticate(block: Int, uid: Data, key: Data, type: KeyType) throws -> Bool
     func readBlock(_ block: Int) throws -> Data?
+}
+
+extension NestedRecoveryTransport {
+    var requiresSAMConfiguration: Bool { true }
 }
 
 /// Native reimplementation of the mfoc nested-authentication key recovery,
@@ -149,7 +154,11 @@ final class NestedRecoverySession {
     /// Reset the reader into initiator mode with chip CRC/parity handling on and
     /// the RF field re-powered, then reselect the card. Mirror of mf_configure.
     func configureForAuth() throws {
-        _ = try transport.rawPN532(Data([0xD4, 0x14, 0x01, 0x14, 0x01]))
+        if transport.requiresSAMConfiguration {
+            _ = try transport.rawPN532(Data([0xD4, 0x14, 0x01, 0x14, 0x01]))
+        } else {
+            logger("PM6 已完成 HID 初始化，复用当前模式，跳过无响应的重复 SAMConfig")
+        }
         try transport.writeRegister(Self.ciuBitFraming, value: 0x00)
         try readModifyWrite(Self.ciuTxMode, clearMask: 0x80, setMask: 0x80)
         try readModifyWrite(Self.ciuRxMode, clearMask: 0x80, setMask: 0x80)
@@ -163,6 +172,11 @@ final class NestedRecoverySession {
         let selection = try transport.rawPN532(Data([0xD4, 0x4A, 0x01, 0x00]))
         guard selection.count >= 8, selection[0] == 0xD5, selection[1] == 0x4B, selection[2] > 0 else {
             throw AppError.noCard
+        }
+        let uidLength = Int(selection[7])
+        guard selection.count >= 8 + uidLength,
+              selection.subdata(in: 8..<(8 + uidLength)) == target.uid else {
+            throw AppError.operation("Recovery stopped: card changed")
         }
     }
 
@@ -369,10 +383,31 @@ final class NestedRecoverySession {
         exploitType: KeyType,
         exploitTrailer: Int,
         targetTrailer: Int,
-        targetAuthByte: UInt8
+        targetAuthByte: UInt8,
+        warmups: Int = 0,
+        token: CancellationToken? = nil
     ) throws -> (nt: UInt32, ntEnc: UInt32, parity: [UInt8]) {
         let base = try performBaseAuth(exploitKey: exploitKey, exploitType: exploitType, exploitTrailer: exploitTrailer)
         var state = base.state
+        for _ in 0..<warmups {
+            try token?.check()
+            try disableCRC()
+            try disableParity()
+            let auth = encryptAuthCommand(state: &state, authByte: exploitType == .a ? 0x60 : 0x61, block: exploitTrailer)
+            let rx = try transceiveBits(auth.data, parity: auth.parity)
+            guard rx.data.count >= 4 else { throw AppError.operation("warmup nonce too short") }
+            let enc = bytesToUInt32(rx.data)
+            var nextState = Crypto1.create(key: exploitKey)
+            let plain = enc ^ Crypto1.word(&nextState, input: enc ^ uidLast4, isEncrypted: true)
+            guard Crypto1.validatePrngNonce(plain) else { throw AppError.operation("warmup nonce invalid") }
+            let header = encryptHeader(state: &nextState, nt: plain)
+            let at = try transceiveBits(header.data, parity: header.parity)
+            let forwarded = Crypto1.prngSuccessor(header.ntForward, 32)
+            let expected = Crypto1.word(&nextState, input: 0, isEncrypted: false) ^ forwarded
+            guard at.data.count >= 4, bytesToUInt32(at.data) == expected else { throw AppError.operation("warmup At mismatch") }
+            try restoreNormal()
+            state = nextState
+        }
         try disableCRC()
         try disableParity()
         let auth = encryptAuthCommand(state: &state, authByte: targetAuthByte, block: targetTrailer)
@@ -385,6 +420,92 @@ final class NestedRecoverySession {
             return Crypto1.oddParity8(rx.data[i]) != received ? 1 : 0
         }
         return (base.nt, ntEnc, parity)
+    }
+
+    /// Candidate generation alone is not success; callers must authenticate the result.
+    static func calibratedCandidates(plaintext: UInt32, encrypted: UInt32, uid: UInt32,
+                                     token: CancellationToken? = nil) throws -> Set<UInt64> {
+        try token?.check()
+        let input = plaintext ^ uid
+        let states = Crypto1.lfsrRecovery32(plaintext ^ encrypted, input: input)
+        var keys = Set<UInt64>()
+        for (index, original) in states.enumerated() {
+            if index.isMultiple(of: 4096) { try token?.check() }
+            var state = original
+            _ = Crypto1.rollbackWord(&state, input: input, fb: 0)
+            keys.insert(Crypto1.getLFSR(from: state))
+        }
+        return keys
+    }
+
+    /// Calibrate each changed authentication sequence against a sector with a verified key.
+    /// Unstable timing, invalid nonces/parity or an empty intersection are explicit misses.
+    func recoverCalibratedKey(exploitSector: Int, exploitKey: Data, exploitType: KeyType,
+                              targetSector: Int, targetType: KeyType, warmupStart: Int = 0,
+                              samples: Int = 4, progress: ((Double, String) -> Void)? = nil,
+                              token: CancellationToken? = nil) throws -> String? {
+        guard (2...6).contains(samples), (0...60).contains(warmupStart),
+              exploitKey.count == 6 else { throw AppError.operation("无效的交叉采样参数") }
+        let key = keyToUInt64(exploitKey)
+        let exploitBlock = CardLayout.trailerBlock(of: exploitSector)
+        var intersection: Set<UInt64>?
+        var seenSamples = Set<String>()
+        defer { try? restoreNormal() }
+        for sample in 0..<samples {
+            try token?.check()
+            let warmups = warmupStart + sample
+            progress?(Double(sample) / Double(samples), "扇区 \(targetSector) · 交叉采样 \(sample + 1)/\(samples)")
+            var distances: [Int] = []
+            for _ in 0..<2 {
+                try token?.check()
+                try configureForAuth()
+                let control = try performRecoveryAuth(exploitKey: key, exploitType: exploitType,
+                    exploitTrailer: exploitBlock, targetTrailer: exploitBlock,
+                    targetAuthByte: exploitType == .a ? 0x60 : 0x61, warmups: warmups, token: token)
+                var cipher = Crypto1.create(key: key)
+                let plaintext = control.ntEnc ^ Crypto1.word(&cipher, input: control.ntEnc ^ uidLast4, isEncrypted: true)
+                guard Crypto1.validatePrngNonce(plaintext),
+                      Crypto1.validNonce(plaintext, control.ntEnc, plaintext ^ control.ntEnc, parity: control.parity) else {
+                    throw AppError.operation("已知密钥对照未通过随机数/奇偶位校验，本轮停止")
+                }
+                distances.append(Crypto1.nonceDistance(from: control.nt, to: plaintext))
+            }
+            guard distances[0] > 0, distances[0] == distances[1] else {
+                throw AppError.operation("已知扇区的采样距离不稳定，本轮不使用推测数据")
+            }
+            try configureForAuth()
+            let captured = try performRecoveryAuth(exploitKey: key, exploitType: exploitType,
+                exploitTrailer: exploitBlock, targetTrailer: CardLayout.trailerBlock(of: targetSector),
+                targetAuthByte: targetType == .a ? 0x60 : 0x61, warmups: warmups, token: token)
+            let plaintext = Crypto1.prngSuccessor(captured.nt, UInt32(distances[0]))
+            guard Crypto1.validNonce(plaintext, captured.ntEnc, plaintext ^ captured.ntEnc, parity: captured.parity) else {
+                logger("扇区 \(targetSector)：目标样本未通过校验，跳过，不生成密钥")
+                continue
+            }
+            let signature = "\(plaintext):\(captured.ntEnc):\(captured.parity)"
+            guard seenSamples.insert(signature).inserted else {
+                logger("扇区 \(targetSector)：重复样本已跳过")
+                continue
+            }
+            let keys = try Self.calibratedCandidates(plaintext: plaintext, encrypted: captured.ntEnc,
+                                                     uid: uidLast4, token: token)
+            intersection = intersection.map { $0.intersection(keys) } ?? keys
+            logger("扇区 \(targetSector) 样本 \(sample + 1)：距离 \(distances[0])，交集 \(intersection!.count) 个候选")
+            guard !intersection!.isEmpty else { return nil }
+            if seenSamples.count >= 2, intersection!.count <= 50 {
+                for candidate in intersection!.sorted() {
+                    try token?.check()
+                    try configureForAuth()
+                    if try verify(key: candidate, sector: targetSector, type: targetType) {
+                        let verified = keyHex(candidate)
+                        logger("扇区 \(targetSector) Key \(targetType.rawValue) 已通过实卡认证")
+                        progress?(1, "扇区 \(targetSector) 密钥已验证")
+                        return verified
+                    }
+                }
+            }
+        }
+        return nil
     }
 
     // MARK: - Candidate verification
@@ -470,6 +591,7 @@ final class NestedRecoverySession {
                 var ntProbe = Crypto1.prngSuccessor(recovery.nt, UInt32(lower))
                 var probeDistance = lower
                 while probeDistance <= median + tolerance {
+                    try token?.check()
                     let ks1 = recovery.ntEnc ^ ntProbe
                     if Crypto1.validNonce(ntProbe, recovery.ntEnc, ks1, parity: recovery.parity) {
                         let states = Crypto1.lfsrRecovery32(ks1, input: ntProbe ^ uid)

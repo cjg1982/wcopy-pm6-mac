@@ -102,7 +102,7 @@ final class AppModel: ObservableObject {
         do { transport = try HIDTransport(descriptor: descriptor) }
         catch { errorMessage = error.localizedDescription; return }
 
-        let newReader = WCopyReader(transport: transport, logger: appendLog)
+        let newReader = WCopyReader(transport: transport, productID: descriptor.productID, logger: appendLog)
         reader = newReader
         connectionState = .connecting
         startOperation(label: "连接读卡器", allowDisconnected: true) { [weak self] token in
@@ -145,9 +145,16 @@ final class AppModel: ObservableObject {
         keyType: KeyType,
         readAll: Bool,
         sectors: String,
-        scanMode: CardScanMode
+        scanMode: CardScanMode,
+        autoRecover: Bool = false,
+        recoveryRounds: Int = 3
     ) {
         guard let reader else { errorMessage = AppError.notConnected.localizedDescription; return }
+        if autoRecover {
+            readAndRecover(key: key, readAll: readAll, sectors: sectors,
+                           scanMode: scanMode, rounds: recoveryRounds)
+            return
+        }
         readResult = nil
         activeDump = nil
         startOperation(label: "自动检测并读取") { [weak self] token in
@@ -235,21 +242,80 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func applyAutomaticRead(_ outcome: KeyCheckOutcome) {
+        let sectors = outcome.sectorKeys.keys.sorted()
+        let missing = AutomaticSectorRecovery.unresolvedSectors(sectors: sectors, blocks: outcome.blocks)
+        let result = ReadResult(target: outcome.target, blocks: outcome.blocks,
+                                failedSectors: missing, failedBlocks: outcome.failedBlocks)
+        keyResults = outcome.sectorKeys
+        keyCheckAttempts = outcome.attempts
+        keyCandidateCount = outcome.candidateCount
+        readResult = result
+        let authentication: (String, KeyType)? = outcome.sectorKeys.values.sorted { $0.sector < $1.sector }.compactMap { item in
+            if let a = item.keyA { return (a, KeyType.a) }
+            if let b = item.keyB, item.keyBAuthenticates == true { return (b, KeyType.b) }
+            return nil
+        }.first
+        activeDump = authentication.map { result.dump(key: $0.0, keyType: $0.1, sectorKeys: outcome.sectorKeys) }
+    }
+
+    private func readAndRecover(key: String, readAll: Bool, sectors: String,
+                                scanMode: CardScanMode, rounds: Int) {
+        guard let reader, canOperate else { return }
+        let requested: [Int]?
+        let candidates: [String]
+        do {
+            requested = try readAll ? nil : parseSectors(sectors)
+            let supplied = key.trimmingCharacters(in: .whitespacesAndNewlines)
+            candidates = MifareKeyDictionary.merged([supplied.isEmpty ? [] : [try normalizeMifareKey(supplied)],
+                                                      MifareKeyDictionary.quickKeys])
+        } catch { errorMessage = error.localizedDescription; return }
+        keyResults = [:]
+        readResult = nil
+        activeDump = nil
+        showMfocPrompt = false
+        startOperation(label: "读取并自动补全未读扇区") { [weak self] token in
+            guard let self else { return }
+            let recovery = AutomaticSectorRecovery(reader: reader, logger: self.appendLog)
+            let outcome = try recovery.run(candidates: candidates, sectors: requested, rounds: rounds,
+                scanMode: scanMode, token: token,
+                progress: { value, text in self.updateProgress(value, text: text) },
+                checkpoint: { partial in
+                    Task { @MainActor [weak self] in self?.applyAutomaticRead(partial) }
+                })
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.applyAutomaticRead(outcome)
+                let unresolved = AutomaticSectorRecovery.unresolvedSectors(
+                    sectors: outcome.sectorKeys.keys.sorted(), blocks: outcome.blocks)
+                self.noticeMessage = unresolved.isEmpty
+                    ? "所选扇区已全部读出，共 \(outcome.blocks.count) 块；未写入卡片"
+                    : "已保留 \(outcome.blocks.count) 块，仍未读出扇区：\(unresolved.map(String.init).joined(separator: ", "))；可导出部分备份"
+            }
+        }
+    }
+
     func checkKeys(
         preset: KeyDictionaryPreset,
         customKeys: [String],
+        sectors: [Int]? = nil,
+        rounds: Int = 1,
         scanMode: CardScanMode
     ) {
         guard let reader else { errorMessage = AppError.notConnected.localizedDescription; return }
         let candidates = MifareKeyDictionary.merged([preset.keys, customKeys])
-        keyResults = [:]
+        let retainedUID = readResult?.target.uid
+        let retainedResults = sectors == nil ? [:] : keyResults
+        keyResults = retainedResults
         keyCheckAttempts = 0
         keyCandidateCount = candidates.count
         readResult = nil
         activeDump = nil
         startOperation(label: "检查常用密钥") { [weak self] token in
-            let outcome = try reader.checkKeys(
+            let outcome = try reader.checkKeysWithRetries(
                 candidates: candidates,
+                sectors: sectors,
+                rounds: rounds,
                 scanMode: scanMode,
                 progress: { value, text in self?.updateProgress(value, text: text) },
                 token: token
@@ -271,7 +337,7 @@ final class AppModel: ObservableObject {
                 readResult.dump(key: $0.0, keyType: $0.1, sectorKeys: results)
             }
             Task { @MainActor [weak self] in
-                self?.keyResults = results
+                self?.keyResults = retainedUID == target.uid ? retainedResults.merging(results) { _, new in new } : results
                 self?.keyCheckAttempts = outcome.attempts
                 self?.keyCandidateCount = outcome.candidateCount
                 self?.readResult = readResult

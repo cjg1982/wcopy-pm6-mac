@@ -157,6 +157,8 @@ final class LibNFCBridge {
                 }
             }
         }
+        response = Self.normalizePM6AuthenticationResponse(response, request: payload,
+                                                          enabled: reader.usesPM6AuthenticationCompatibility)
         if response.suffix(2) == Data([0x90, 0x00]) { response.removeLast(2) }
         if command == 0x4A {
             let hex = response.map { String(format: "%02X", $0) }.joined(separator: " ")
@@ -168,6 +170,15 @@ final class LibNFCBridge {
             }
         }
         return response
+    }
+
+    static func normalizePM6AuthenticationResponse(_ response: Data, request: Data, enabled: Bool) -> Data {
+        guard enabled, request.count == 15,
+              request[0] == 0xD4, request[1] == 0x40, request[2] == 1,
+              request[3] == 0x60 || request[3] == 0x61,
+              response == Data([0xD5, 0x41, 0xFD, 0x90, 0]) else { return response }
+        // Expose this verified PM6 authentication rejection as standard libnfc status 14.
+        return Data([0xD5, 0x41, 0x14, 0x90, 0])
     }
 
     private static func syntheticTimeoutResponse(for payload: Data) -> Data {

@@ -46,7 +46,7 @@ struct MutationError: LocalizedError {
 }
 
 enum AppVersion {
-    static let current = "1.4.0"
+    static let current = "1.4.0-pm6.1"
 }
 
 enum HexCodec {

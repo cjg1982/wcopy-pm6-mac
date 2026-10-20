@@ -110,7 +110,7 @@ struct CLICommandResult {
 
 enum WCopyCLI {
     static let schemaVersion = 1
-    static let version = "1.4.0"
+    static let version = AppVersion.current
     private static let deviceValueOptions: Set<String> = ["device-id", "device-index", "sync-radius"]
     private static let commonFlags: Set<String> = ["pretty", "verbose"]
     private static let cancellationToken = CancellationToken()
@@ -197,7 +197,7 @@ enum WCopyCLI {
             "version": version,
             "schemaVersion": schemaVersion,
             "platform": "macOS 13+",
-            "supportedUSBIDs": ["0416:B008", "0416:B030"],
+            "supportedUSBIDs": ["0416:B008", "0416:B029", "0416:B030"],
             "cardModes": ["auto", "sak19", "mini", "1k", "2k", "4k"],
             "commands": [
                 commandCapability("devices", mutating: false, hardware: false),
@@ -205,7 +205,7 @@ enum WCopyCLI {
                 commandCapability("reader-info", mutating: false, hardware: true),
                 commandCapability("card-info", mutating: false, hardware: true),
                 commandCapability("read", mutating: false, hardware: true),
-                commandCapability("keys", mutating: false, hardware: true),
+                commandCapability("keys", mutating: false, hardware: true).merging(["sectorFilter": true, "maxRetryRounds": 3]) { _, new in new },
                 commandCapability("recover", mutating: false, hardware: true),
                 commandCapability("verify-key", mutating: false, hardware: true),
                 commandCapability("restore", mutating: true, hardware: true),
@@ -343,11 +343,15 @@ enum WCopyCLI {
 
     private static func keysCommand(_ options: CLIOptions) throws -> CLICommandResult {
         try options.validate(
-            valueOptions: deviceValueOptions.union(["card-mode", "dictionary", "format", "key", "output", "preset"]),
+            valueOptions: deviceValueOptions.union(["card-mode", "dictionary", "format", "key", "output", "preset", "sectors", "rounds"]),
             flagOptions: commonFlags.union(["force"]),
             repeatableValueOptions: ["dictionary", "key"]
         )
         try validateOutputOptions(options)
+        guard let rounds = Int(options.value("rounds") ?? "1"), (1...3).contains(rounds) else {
+            throw CLIError.usage("--rounds 必须为 1–3")
+        }
+        let sectors = try options.value("sectors").map { try parseSectors($0) }
         let mode = try parseCardMode(options.value("card-mode"))
         let preset = try dictionaryPreset(options.value("preset"))
         var customKeys = try options.allValues("key").map(normalizeMifareKey)
@@ -368,8 +372,10 @@ enum WCopyCLI {
         }
         let candidates = MifareKeyDictionary.merged([preset.keys, customKeys])
         let outcome = try withReader(options) { reader, _, _, _ in
-            try reader.checkKeys(
+            try reader.checkKeysWithRetries(
                 candidates: candidates,
+                sectors: sectors,
+                rounds: rounds,
                 scanMode: mode,
                 progress: progressLogger(options),
                 token: cancellationToken
@@ -784,7 +790,7 @@ enum WCopyCLI {
         let descriptor = devices[index]
         let transport = try HIDTransport(descriptor: descriptor)
         let verbose = options.hasFlag("verbose")
-        let reader = WCopyReader(transport: transport, logger: { if verbose { log($0) } })
+        let reader = WCopyReader(transport: transport, productID: descriptor.productID, logger: { if verbose { log($0) } })
         defer { reader.close() }
         let radius = try syncRadius(options.value("sync-radius"))
         try reader.sync(
@@ -1113,7 +1119,7 @@ enum WCopyCLI {
             """
         case "keys":
             text = """
-            Usage: wcopy-nfc keys [--preset common|patterns|custom]
+            Usage: wcopy-nfc keys [--preset common|patterns|custom] [--sectors RANGE] [--rounds 1|2|3]
                    [--dictionary FILE]... [--key HEX]... [--card-mode MODE]
                    [--output FILE] [--format json|mfd]
             Checks Key A and Key B for every sector and returns all discovered slots.

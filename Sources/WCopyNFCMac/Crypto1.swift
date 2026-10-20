@@ -2,7 +2,9 @@ import Foundation
 
 /// Crypto1 stream cipher primitives for MIFARE Classic.
 ///
-/// This is an original Swift implementation of the published Crypto1 cipher
+/// Inherited from zhjcreator/wcopy-nfc-mac (see docs/PROVENANCE.md).
+/// Upstream describes this as an independent implementation; that provenance
+/// has not been fully audited by this adaptation. Implements the Crypto1 cipher
 /// (48-bit LFSR with the 20-bit filter function and the 16-bit nonce PRNG), the
 /// odd/even split state representation, and the LFSR-state recovery/rollback
 /// helpers used by nested-authentication key recovery. Behavior is pinned to the
