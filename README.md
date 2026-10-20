@@ -13,7 +13,9 @@ The app supports both **English and Chinese**, detecting the system language aut
 
 ## Device Support
 
-![wCopy NFC reader](docs/images/reader.png)
+![USB NFC reader illustrations](docs/images/reader-duo-illustration.png)
+
+*AI-generated illustration based on user-provided device references; not a manufacturer photo or evidence of compatibility. Refer to the verified device table below.*
 
 | VID:PID | Status |
 | --- | --- |

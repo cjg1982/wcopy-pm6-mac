@@ -11,7 +11,9 @@
 
 ## 设备支持
 
-![wCopy NFC 读卡器](docs/images/reader.png)
+![USB NFC 读卡器双设备示意图](docs/images/reader-duo-illustration.png)
+
+*根据用户提供的设备参考图由 AI 生成，仅为外观示意，非厂商实拍，也不代表图中设备均已验证兼容。具体支持范围见下表。*
 
 | VID:PID | 状态 |
 | --- | --- |
