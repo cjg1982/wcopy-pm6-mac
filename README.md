@@ -19,6 +19,8 @@ The app supports both **English and Chinese**, detecting the system language aut
 | --- | --- |
 | `0416:b008` | HID sequence sync and init handshake verified on `wCopy NSR106-IDIC V601` hardware |
 | `0416:b030` | Validated by upstream on real Linux hardware; same protocol, native macOS implementation |
+| `0416:b029` | PM6 verified locally on firmware `wCopy NSR122-H V701A2`; other firmware requires validation |
+
 
 Readers of the same family that expose the same wCopy USB‑HID protocol
 (`0416:b008` / `0416:b030`) are supported as well — the app detects them by the
@@ -29,6 +31,10 @@ USB enumeration and protocol compatibility are displayed separately. A detected 
 not mean the protocol is ready — only after serial number sync and the four‑step
 initialization will the status report "Protocol Ready". If `b008` syncing fails, the app
 preserves diagnostic info rather than reporting a false connection.
+
+### PN532 compatibility
+
+Compatible with PN532 command transport through the supported wCopy/PM6 USB-HID wrapper. This is not universal support for standalone PN532 UART, I²C or SPI modules; direct connection to those modules is not implemented. The optional libnfc bridge exposes a virtual PN532 UART interface for external tools and still requires a supported wCopy reader.
 
 ## Features
 
