@@ -559,3 +559,7 @@ PM6 V701A2 的 `recover` 使用已完成 HID 初始化的模式，跳过无响�
 PM6 libnfc bridge 对已验证的 NSR122-H V701A2 固件，将完整响应 D5 41 FD 90 00 仅在对应的 15 字节 MIFARE Key A/Key B 认证请求中转换为标准认证拒绝码 14。响应转换发生在桥接边界，不修改卡片；其他命令及未知响应不转换。已验证 nfc-list 寻卡与 mfoc Nested 采集流程，恢复结果仍以实际认证为准。
 
 GUI and CLI version output share `AppVersion.current`; the local PM6 adaptation reports `1.4.0-pm6.1`. This version change does not change schemaVersion.
+
+Local pm6.2 restore keeps --no-verify, but default verification now adds a final RF-reset/fresh-authentication comparison pass. The additive verification object reports checkedBlocks, matchedBlocks, mismatchedBlocks, unreadableBlocks, failedKeySectors and rfResetBeforeRead. verified is null when disabled. schemaVersion remains 1. CLI version now reports 1.4.0-pm6.2.
+
+On the verified PM6 NSR122-H V701A2 firmware, a successful nonempty restore also sends a best-effort reader-local buzzer command after verification (if enabled). Buzzer failures are logged separately; they do not change restore results or prove card usability.
