@@ -51,6 +51,7 @@ struct ContentView: View {
                         switch model.page {
                         case .overview: OverviewView()
                         case .read: ReadCardView()
+                        case .directCopy: DirectCopyView()
                         case .restore: RestoreView()
                         case .mfocRecovery: MfocRecoveryView()
                         case .uid: UIDView()
@@ -578,6 +579,65 @@ private struct BlockRow: Identifiable {
     let id: Int
     let data: Data
 }
+private struct DirectCopyView: View {
+    @EnvironmentObject private var model: AppModel
+    @State private var sourceKey = "FFFFFFFFFFFF"
+    @State private var targetKey = "FFFFFFFFFFFF"
+    @State private var mode: CardCopyMode = .normal
+    @State private var confirming = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            PageHeader(eyebrow: "COPY", title: "读取与复制", subtitle: "读取一次源卡，连续复制到多张空卡，无需保存或导入备份文件。")
+            Surface {
+                VStack(alignment: .leading, spacing: 16) {
+                    Label("1. 读取源卡", systemImage: "wave.3.right").font(.headline)
+                    if let dump = model.copyCache {
+                        DataPair(label: "源卡 UID", value: dump.uid)
+                        DataPair(label: "缓存", value: "\(dump.blocks.count) 块 · \(dump.inferredKind.rawValue)")
+                    } else {
+                        SecureField("源卡 Key A（同时检测常用公开密钥）", text: $sourceKey)
+                        Button("读取源卡") { model.readCopySource(key: sourceKey) }
+                            .buttonStyle(.borderedProminent).tint(brandTeal)
+                            .disabled(!model.canOperate)
+                    }
+                    Text("缓存仅保存在本次程序内存中；点击结束或退出程序后清空。源卡读取不完整时不能开始复制。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            Surface {
+                VStack(alignment: .leading, spacing: 16) {
+                    Label("2. 放入空卡并复制", systemImage: "doc.on.doc").font(.headline)
+                    Picker("复制模式", selection: $mode) {
+                        ForEach(CardCopyMode.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                    Text(mode.explanation).font(.caption).foregroundStyle(mode == .complete ? brandOrange : .secondary)
+                    SecureField("空卡 Key A", text: $targetKey)
+                    Text("默认空卡密钥 FFFFFFFFFFFF；每次复制都会重新认证并校验，校验通过后 PM6 机身提示。完整复制需要兼容的可改 UID 卡。")
+                        .font(.caption).foregroundStyle(.secondary)
+                    HStack {
+                        Button("复制到当前卡") { confirming = true }
+                            .buttonStyle(.borderedProminent).tint(brandTeal)
+                            .disabled(!model.canOperate || model.copyCache == nil)
+                        Button("结束并清空缓存") { model.endCopySession() }
+                            .disabled(model.busy || model.copyCache == nil)
+                    }
+                }.disabled(model.busy)
+            }
+            Surface {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(model.copyStatus).font(.headline)
+                    Text("本次成功复制：\(model.copyCount) 张").foregroundStyle(brandTeal)
+                }
+            }
+        }
+        .confirmationDialog("确认覆盖当前卡？", isPresented: $confirming, titleVisibility: .visible) {
+            Button("确认复制", role: .destructive) { model.copyCachedSource(mode: mode, targetKey: targetKey) }
+            Button("取消", role: .cancel) {}
+        } message: { Text(mode.explanation + " 请确认源卡已取走，当前放置的是允许覆盖的目标卡。") }
+    }
+}
+
 private struct RestoreView: View {
     @EnvironmentObject private var model: AppModel
     @State private var keyOverride = ""
@@ -673,15 +733,26 @@ private struct RestoreView: View {
                         Text(copyMode.explanation)
                             .font(.caption)
                             .foregroundStyle(copyMode == .complete ? brandOrange : .secondary)
-                        Toggle("写后回读验证", isOn: Binding(
+                        Toggle("写入后校验（重新认证）", isOn: Binding(
                             get: { copyMode == .complete || verify },
                             set: { verify = $0 }
                         ))
                             .disabled(copyMode == .complete || model.busy)
+                        Text("写完后重置射频连接，重新认证并逐块比较。校验一致仅说明内容相同，不保证门锁可用；提示音不作为成功依据。")
+                            .font(.caption).foregroundStyle(.secondary)
                         if copyMode == .complete {
                             Text("完整复制强制验证。请先保存目标卡备份；不能保证复制后能开门。")
                                 .font(.caption).foregroundStyle(brandOrange)
                         }
+                        Button("只校验当前卡（不写入）") {
+                            model.verifyImportedDump(options: RestoreOptions(
+                                keyOverride: keyOverride.isEmpty ? nil : keyOverride,
+                                keyTypeOverride: keyOverride.isEmpty ? nil : keyType,
+                                includeBlock0: copyMode.includesProtectedBlocks,
+                                includeTrailers: copyMode.includesProtectedBlocks,
+                                verify: true, targetSectorKeys: model.keyResults), scanMode: scanMode)
+                        }
+                        .disabled(!model.canOperate || model.importedDump == nil)
                         Button("开始复制") {
                             do {
                                 if let dump = model.importedDump { try copyMode.validate(dump) }
