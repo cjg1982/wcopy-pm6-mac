@@ -5,6 +5,7 @@ import Foundation
 enum NavigationPage: String, CaseIterable, Identifiable {
     case overview = "概览"
     case read = "读取与备份"
+    case directCopy = "读取与复制"
     case restore = "恢复转储"
     case mfocRecovery = "密钥恢复"
     case uid = "UID 工具"
@@ -17,6 +18,7 @@ enum NavigationPage: String, CaseIterable, Identifiable {
         switch self {
         case .overview: return "square.grid.2x2"
         case .read: return "wave.3.right.circle"
+        case .directCopy: return "doc.on.doc"
         case .restore: return "square.and.arrow.down.on.square"
         case .mfocRecovery: return "key.horizontal"
         case .uid: return "number.square"
@@ -62,6 +64,9 @@ final class AppModel: ObservableObject {
     @Published var readResult: ReadResult?
     @Published var activeDump: DumpDocument?
         @Published var importedDump: DumpDocument?
+    @Published private(set) var copyCache: DumpDocument?
+    @Published private(set) var copyCount = 0
+    @Published private(set) var copyStatus = "请放入源卡，点击读取源卡"
     @Published var detectedSectorKeys: [Int: SectorKeyResult]?
     @Published var keyResults: [Int: SectorKeyResult] = [:]
     @Published var keyCheckAttempts = 0
@@ -413,6 +418,72 @@ final class AppModel: ObservableObject {
         }.resume()
     }
 
+    func readCopySource(key: String) {
+        guard canOperate, let reader, copyCache == nil else { return }
+        copyStatus = "正在读取源卡…"
+        startOperation(label: "读取源卡到缓存") { [weak self] token in
+            guard let self else { return }
+            do {
+                let custom = try normalizeMifareKey(key)
+                let outcome = try reader.checkKeys(candidates: MifareKeyDictionary.merged([[custom], KeyDictionaryPreset.common.keys]),
+                    progress: { self.updateProgress($0, text: $1) }, token: token)
+                let missing = AutomaticSectorRecovery.unresolvedSectors(
+                    sectors: Array(0..<outcome.target.kind.sectorCount), blocks: outcome.blocks)
+                guard missing.isEmpty, !outcome.blocks.isEmpty else {
+                    throw AppError.operation("源卡读取不完整，未读扇区：\(missing)。未建立复制缓存，请到读取与备份页面检查")
+                }
+                let result = ReadResult(target: outcome.target, blocks: outcome.blocks, failedSectors: [], failedBlocks: [])
+                let dump = try result.dump(key: custom, keyType: .a, sectorKeys: outcome.sectorKeys).validated()
+                Task { @MainActor [weak self] in
+                    self?.copyCache = dump
+                    self?.copyCount = 0
+                    self?.copyStatus = "读取成功，已缓存 \(dump.blocks.count) 块。请取走源卡，放入空卡后点击复制"
+                }
+            } catch {
+                Task { @MainActor [weak self] in self?.copyStatus = "读取失败，未建立缓存，请重新读取" }
+                throw error
+            }
+        }
+    }
+
+    func copyCachedSource(mode: CardCopyMode, targetKey: String) {
+        guard canOperate, let reader, let dump = copyCache else { return }
+        copyStatus = "正在复制，请保持卡片不动…"
+        startOperation(label: "复制缓存到当前卡", cancellable: false) { [weak self] token in
+            guard let self else { return }
+            do {
+                try mode.validate(dump)
+                let key = try normalizeMifareKey(targetKey)
+                guard let target = try reader.selectTarget() else { throw AppError.noCard }
+                guard HexCodec.string(target.uid) != dump.uid else {
+                    throw AppError.operation("当前卡 UID 与源卡相同，请取走源卡并放入新的空卡")
+                }
+                let result = try reader.restore(dump: dump, options: RestoreOptions(
+                    keyOverride: key, keyTypeOverride: .a,
+                    includeBlock0: mode.includesProtectedBlocks, includeTrailers: mode.includesProtectedBlocks,
+                    verify: true), progress: { self.updateProgress($0, text: $1) }, token: token)
+                guard result.failed.isEmpty, result.verification?.passed == true else {
+                    throw AppError.operation("复制或校验失败，失败块：\(result.failed)。缓存已保留，请检查当前卡；不会自动重写")
+                }
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.copyCount += 1
+                    self.copyStatus = "复制成功，写入并校验 \(result.written) 块。请放入下一张空卡继续复制，或点击结束"
+                }
+            } catch {
+                Task { @MainActor [weak self] in self?.copyStatus = "复制未完成，源卡缓存仍保留。请查看错误信息" }
+                throw error
+            }
+        }
+    }
+
+    func endCopySession() {
+        guard !busy else { return }
+        copyCache = nil
+        copyCount = 0
+        copyStatus = "本次复制已结束，缓存已清空。请放入新的源卡"
+    }
+
     func restoreDump(options: RestoreOptions, scanMode: CardScanMode) {
         guard let reader else { errorMessage = AppError.notConnected.localizedDescription; return }
         guard let dump = importedDump else { errorMessage = "请先导入 JSON 或 MFD 转储"; return }
@@ -425,7 +496,29 @@ final class AppModel: ObservableObject {
                 token: token
             )
             Task { @MainActor [weak self] in
-                self?.noticeMessage = "恢复完成：写入 \(result.written) 块，失败 \(result.failed.count) 块，安全跳过 \(result.skipped) 块"
+                let detail: String
+                if let report = result.verification {
+                    detail = "重新认证校验：一致 \(report.matched)/\(report.checked) 块；差异 \(report.mismatchedBlocks)，无法读取 \(report.unreadableBlocks)，密钥异常扇区 \(report.failedKeySectors)"
+                } else { detail = "未启用写后校验，仅收到设备写入应答" }
+                if result.failed.isEmpty {
+                    self?.noticeMessage = "设备接受写入 \(result.written) 块，跳过 \(result.skipped) 块。\(detail)"
+                } else {
+                    self?.errorMessage = "写入/校验未全部通过，失败块：\(result.failed)。\(detail)；请勿直接当作可用复制卡"
+                }
+            }
+        }
+    }
+
+    func verifyImportedDump(options: RestoreOptions, scanMode: CardScanMode) {
+        guard let reader, canOperate else { return }
+        guard let dump = importedDump else { errorMessage = "请先导入要比较的源文件"; return }
+        startOperation(label: "只读校验卡片", cancellable: true) { [weak self] token in
+            let report = try reader.verifyDump(dump: dump, options: options, scanMode: scanMode,
+                progress: { value, text in self?.updateProgress(value, text: text) }, token: token)
+            Task { @MainActor [weak self] in
+                let detail = "一致 \(report.matched)/\(report.checked) 块；差异块 \(report.mismatchedBlocks)，无法读取 \(report.unreadableBlocks)，密钥异常扇区 \(report.failedKeySectors)"
+                if report.passed { self?.noticeMessage = "只读校验完成：\(detail)。仅确认内容一致，没有执行写入" }
+                else { self?.errorMessage = "只读校验未通过：\(detail)" }
             }
         }
     }

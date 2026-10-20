@@ -686,7 +686,12 @@ enum WCopyCLI {
             "failedBlocks": result.failed,
             "skippedBlocks": result.skipped,
             "verificationEnabled": !options.hasFlag("no-verify"),
-            "verified": options.hasFlag("no-verify") ? NSNull() : result.failed.isEmpty
+            "verified": result.verification.map { $0.passed && result.failed.isEmpty } as Any? ?? NSNull(),
+            "verification": result.verification.map { report -> [String: Any] in
+                ["checkedBlocks": report.checked, "matchedBlocks": report.matched,
+                 "mismatchedBlocks": report.mismatchedBlocks, "unreadableBlocks": report.unreadableBlocks,
+                 "failedKeySectors": report.failedKeySectors, "rfResetBeforeRead": true]
+            } as Any? ?? NSNull()
         ], exitCode: result.failed.isEmpty ? CLIExitCode.success : CLIExitCode.partialResult)
     }
 
