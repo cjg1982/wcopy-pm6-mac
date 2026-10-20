@@ -1,5 +1,7 @@
 # wCopy NFC for Mac
 
+> **PM6 adaptation:** Based on [zhjcreator/wcopy-nfc-mac](https://github.com/zhjcreator/wcopy-nfc-mac), with local PM6 compatibility and automatic recovery changes assisted by OpenAI Codex. Existing application and recovery code are inherited, not wholly original. See [provenance and license-review limits](docs/PROVENANCE.md) and [third-party notices](THIRD_PARTY_NOTICES.md).
+
 English | [中文](README_zh.md)
 
 A native macOS GUI tool for the wCopy / NSR106-IDIC V USB NFC reader. Built from the
@@ -265,3 +267,31 @@ Mario Giordano's `wcopy-nfc-linux` (MIT License). Full upstream license details 
 in `THIRD_PARTY_NOTICES.md`.
 
 This project is also released under the MIT License — see `LICENSE`.
+
+## PM6 compatibility validation
+
+This local adaptation adds discovery of `0416:B029` (WCopy PM6). A 64-byte HID input/output interface has been observed on this Mac. On 2026-10-20, sync and all four initialization exchanges succeeded on firmware `wCopy NSR122-H V701A2`. PM6 validates response command identifiers rather than the B008/B030 sequence field, retaining length, checksum, footer and command matching checks. Read-only testing on a Classic 1K card returned 60 blocks across 15 sectors, identical on a second read. Sector 6 returned status 0x3D with the default A/B key. Full backup and writes remain unverified; enumeration alone does not establish protocol compatibility.
+
+The key panel adds a sector-6-only filter and a Proxmark3 sector 6 action. The latter downloads the GPLv3+ default key dictionary at runtime and checks only sector 6 Key A/Key B, with cancellation and no automatic Nested recovery. The dictionary is not bundled. Unknown protocol errors stop checking. Only B029 with the exact firmware `wCopy NSR122-H V701A2` maps the complete response `D5 41 FD 90 00` to an authentication miss, followed by card reselection. A known-good / wrong-key / known-good control verified this response. The previous displayed 0x3D came from masking the raw FD byte; other responses and devices retain strict error handling.
+
+Sector 6 repeated checking downloads the Proxmark3 dictionary and retries transport failures up to three attempts, resynchronizing and reinitializing the same serialized HID session between attempts. It pins the original card UID and supports cancellation. Any completed dictionary check ends immediately, including a no-hit result; Nested recovery is never started automatically. Exhausted errors are reported as incomplete checks, not missing keys.
+
+PM6 native recovery transport validation: V701A2 is initialized by the four HID exchanges and does not answer a redundant SAMConfig. Only for this identified firmware, recovery reuses the initialized mode while retaining CIU setup, RF reset and selection. Nonce and distance acquisition have been observed. Acquisition is not key recovery; candidates must authenticate against the physical card.
+
+PM6 libnfc bridging has passed nfc-list detection and reached external mfoc Nested acquisition. Only on the exact identified V701A2 firmware, the bridge normalizes D5 41 FD 90 00 to standard libnfc authentication error 14 for MIFARE Key A/Key B authentication requests. Other requests and unknown responses are unchanged. Acquisition does not establish successful key recovery.
+
+### Automatic completion of unread sectors (PM6)
+
+The read page now enables read-only automatic recovery by default, with 1–10 rounds (default 3). It checks common keys and reads first, then retries only incomplete sectors using known-key controls, varied authentication sequences and candidate intersections. A candidate must authenticate against the card before being used. Cancellation retains the latest partial checkpoint. Card changes, removal and transport errors stop the operation. No card writes occur.
+
+At least one verified entry key and compatible nonce behavior are required; retries cannot guarantee recovery. Independent PM6 sector-6 samples previously recovered a physically verified key; other cards require hardware validation. This explicitly requested automatic read mode is separate from standalone dictionary checking, which retains its manual recovery boundary.
+
+### Copy modes
+
+The restore page offers Normal copy (preserves target UID, keys and access permissions) and Complete copy (includes UID, manufacturer block, all keys and access permissions). Complete mode requires every block, a matching four-byte UID/BCC, both keys in every sector and valid access bits, and forces write verification. The target must support UID writes. Source access restrictions are copied too; door-lock acceptance is not guaranteed. Final confirmation and no automatic write retries are retained.
+
+The format page keeps only the current-key input and format options; dictionary detection remains on Read & Backup. All target sectors are still authenticated before formatting.
+
+### PM6 version identity
+
+The local version is `1.4.0-pm6.1` (suggested tag `v1.4.0-pm6.1`), identifying the first PM6 adaptation prerelease based on upstream 1.4.0. GUI and CLI share the version constant. The macOS bundle uses numeric short version `1.4.0`, build `3`. A later iteration may use `1.4.0-pm6.2`. This does not imply a GitHub release has been published.

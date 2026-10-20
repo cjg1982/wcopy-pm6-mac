@@ -53,3 +53,6 @@ backups/
 .vscode/
 *.swp
 *~
+
+# Private hardware captures, card credentials and diagnostic experiments
+diagnostics/

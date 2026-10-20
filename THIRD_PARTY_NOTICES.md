@@ -1,5 +1,14 @@
 # Third-party notices
 
+## Direct macOS upstream
+
+This adaptation inherits the application from zhjcreator/wcopy-nfc-mac,
+commit 9adcfbfdb3b3caafb26cc6f76aef32eb823302fd (MIT).
+Copyright (c) 2026 wCopy NFC for Mac contributors.
+The complete upstream MIT license is retained in LICENSE.
+See docs/PROVENANCE.md for local changes, Windows binary references,
+AI assistance and outstanding algorithm-source review.
+
 The USB-HID framing, checksum, synchronization sequence, initialization
 commands, and PN532 bridge behavior in this project are based on:
 
@@ -50,13 +59,13 @@ includes the default values conventionally tried by mfoc.
 
 ## Native Crypto1 and nested-key recovery
 
-The in-process Crypto1 cipher, PRNG distance measurement, LFSR state recovery,
-and nested-authentication key recovery in `Crypto1.swift` and
-`NestedRecovery.swift` are an original implementation of the published MIFARE
-Classic Crypto1 algorithm and the mfoc nested-attack flow. They were written
-independently (no GPL source is vendored or transliterated) and pinned to the
-behavior of the reference `mfoc`/`crapto1` implementation by generated test
-vectors in `Crypto1Tests.swift`.
+The base Crypto1 and Nested recovery files are inherited from the macOS
+upstream identified above and modified locally. Upstream describes them as an
+independent implementation of the published algorithm, checked against
+mfoc/crapto1 behavior. This adaptation has not independently established that
+claim through a complete source-provenance audit. See docs/PROVENANCE.md.
+Acknowledgment does not replace any license obligations for copied or
+translated source; public redistribution requires resolving that provenance.
 
 - Reference behavior source (not redistributed):
   https://github.com/nfc-tools/mfoc (GPL-2.0)
