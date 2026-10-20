@@ -319,3 +319,12 @@ The format page keeps only the current-key input and format options; dictionary 
 ### PM6 version identity
 
 The local version is `1.4.0-pm6.1` (suggested tag `v1.4.0-pm6.1`), identifying the first PM6 adaptation prerelease based on upstream 1.4.0. GUI and CLI share the version constant. The macOS bundle uses numeric short version `1.4.0`, build `3`. A later iteration may use `1.4.0-pm6.2`. This does not imply a GitHub release has been published.
+
+### Local revision 1.4.0-pm6.2: post-write verification
+
+The restore-page verification switch defaults on and is mandatory for complete copies. A final pass resets RF, authenticates again and compares every selected block, reporting mismatches, unreadable blocks and credential failures separately. Hidden trailer keys are checked through authentication, with readable access bytes compared separately. A read-only Verify current card button compares the imported source without writes. Matching content does not prove a mutation occurred when source and target were already identical, and cannot guarantee door-lock acceptance. Without verification only device acknowledgment is reported. This local revision has not replaced the public pm6.1 download.
+
+
+PM6 now receives a reader buzzer command after an acknowledged restore completes (after final verification when enabled). A buzzer-command failure is logged separately and does not change the write result. The physical buzzer was confirmed on NSR122-H V701A2; no Mac speaker sound is used.
+
+The new **读取与复制** (Read & Copy) page keeps one fully read source card in memory for repeated, manually confirmed copies to blank cards. It supports normal and complete copy modes, always verifies writes, retains the source cache after a failed copy, and clears it when the session ends or the app exits. No backup file is created. A card matching the source UID is rejected as a target.
