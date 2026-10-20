@@ -3,6 +3,77 @@ import XCTest
 @testable import WCopyNFCMac
 
 final class ProtocolTests: XCTestCase {
+    func testBridgePM6AuthenticationMappingIsScopedToAuthentication() {
+        var request = Data([0xD4, 0x40, 1, 0x60, 27])
+        request.append(Data(repeating: 0xFF, count: 6))
+        request.append(Data([0x11, 0x22, 0x33, 0x44]))
+        let rejection = Data([0xD5, 0x41, 0xFD, 0x90, 0])
+        XCTAssertEqual(LibNFCBridge.normalizePM6AuthenticationResponse(rejection, request: request, enabled: true), Data([0xD5, 0x41, 0x14, 0x90, 0]))
+        XCTAssertEqual(LibNFCBridge.normalizePM6AuthenticationResponse(rejection, request: request, enabled: false), rejection)
+        request[3] = 0x30
+        XCTAssertEqual(LibNFCBridge.normalizePM6AuthenticationResponse(rejection, request: request, enabled: true), rejection)
+        XCTAssertEqual(LibNFCBridge.normalizePM6AuthenticationResponse(rejection, request: Data(), enabled: true), rejection)
+    }
+    func testPM6AuthenticationRejectionRequiresExactFirmwareResponse() throws {
+        let rejection = Data([0xD5, 0x41, 0xFD, 0x90, 0x00])
+        XCTAssertFalse(try WCopyReader.mifareAuthenticationSucceeded(rejection, pm6Compatibility: true))
+        XCTAssertThrowsError(try WCopyReader.mifareAuthenticationSucceeded(rejection))
+        for response in [Data([0xD5, 0x41, 0x3D]), Data([0xD5, 0x41, 0xFD]),
+                         Data([0xD5, 0x41, 0xFD, 0x6F, 0]), Data([0xD5, 0x42, 0xFD, 0x90, 0])] {
+            XCTAssertThrowsError(try WCopyReader.mifareAuthenticationSucceeded(response, pm6Compatibility: true))
+        }
+        XCTAssertTrue(try WCopyReader.mifareAuthenticationSucceeded(Data([0xD5, 0x41, 0, 0x90, 0]), pm6Compatibility: true))
+    }
+    func testPM6DiscoveryAllowListPreservesExistingReaders() {
+        XCTAssertEqual(wcopyVendorID, 0x0416)
+        XCTAssertEqual(Set(supportedProductIDs), Set([0xB008, 0xB029, 0xB030]))
+    }
+
+    func testPM6CapturedFirmwareResponseAndValidation() throws {
+        let query = Data([0xFF, 0x00, 0x68])
+        let captured = try HexCodec.data(from: "021B690177436F7079204E53523132322D4820563730314132C8FD")
+        let expected = Data("wCopy NSR122-H V701A2".utf8)
+        XCTAssertEqual(WCopyReader.parseResponse(captured, sequence: 0, content: query, commandHeader: true), expected)
+        XCTAssertNil(WCopyReader.parseResponse(captured, sequence: 0, content: query, commandHeader: false))
+        XCTAssertNil(WCopyReader.parseResponse(captured, sequence: 0, content: Data([0xFF, 0, 0x69]), commandHeader: true))
+        var corrupt = captured
+        corrupt[4] ^= 1
+        XCTAssertNil(WCopyReader.parseResponse(corrupt, sequence: 0, content: query, commandHeader: true))
+        XCTAssertNil(WCopyReader.parseResponse(Data(captured.dropLast()), sequence: 0, content: query, commandHeader: true))
+    }
+
+    func testKeyCheckSectorSelection() throws {
+        XCTAssertEqual(try WCopyReader.keyCheckSectors([6], sectorCount: 16), [6])
+        XCTAssertEqual(try WCopyReader.keyCheckSectors([6, 0, 6], sectorCount: 16), [0, 6])
+        XCTAssertEqual(try WCopyReader.keyCheckSectors(nil, sectorCount: 16), Array(0..<16))
+        XCTAssertThrowsError(try WCopyReader.keyCheckSectors([], sectorCount: 16))
+        XCTAssertThrowsError(try WCopyReader.keyCheckSectors([-1], sectorCount: 16))
+        XCTAssertThrowsError(try WCopyReader.keyCheckSectors([6], sectorCount: 5))
+    }
+
+    func testKeyCheckRetriesAreBoundedAndStopOnSuccess() throws {
+        var attempts = 0
+        let result: Int = try WCopyReader.retryKeyCheck(rounds: 3, token: nil, attempt: { _ in
+            attempts += 1
+            if attempts < 3 { throw AppError.transport("fixture") }
+            return 42
+        }, onFailure: { _, _ in })
+        XCTAssertEqual(result, 42)
+        XCTAssertEqual(attempts, 3)
+        attempts = 0
+        XCTAssertThrowsError(try WCopyReader.retryKeyCheck(rounds: 3, token: nil, attempt: { _ -> Int in
+            attempts += 1; throw AppError.transport("0x3D")
+        }, onFailure: { _, _ in }))
+        XCTAssertEqual(attempts, 3)
+        attempts = 0
+        XCTAssertThrowsError(try WCopyReader.retryKeyCheck(rounds: 3, token: nil, attempt: { _ -> Int in
+            attempts += 1; throw AppError.noCard
+        }, onFailure: { _, _ in }))
+        XCTAssertEqual(attempts, 1)
+        let token = CancellationToken(); token.cancel()
+        XCTAssertThrowsError(try WCopyReader.retryKeyCheck(rounds: 3, token: token, attempt: { _ in 42 }, onFailure: { _, _ in }))
+    }
+
     func testBuildAndParseFrame() throws {
         let output = try WCopyReader.buildFrame(sequence: 0x0C12, content: Data([0xFF, 0x00, 0x68]))
         XCTAssertEqual(output.count, 64)
